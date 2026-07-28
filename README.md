@@ -16,22 +16,29 @@ refcounting never grants.
 
 ## Features
 
-- **Promotable leases**: `Lease` is a cheap, cloneable, thread-safe handle that is either _loaned_
-  (reads from the retained segment it pins) or _owned_ (holds its own copy). `lease.bytes()` reads
-  uniformly in both states; consumers never need to know which one they are in.
+- **Promotable leases**: `Lease` is a cheap, cloneable handle that is either _loaned_ (reads from
+  the retained segment it pins) or _owned_ (holds its own copy). `lease.bytes()` reads uniformly
+  in both states; consumers never need to know which one they are in.
 - **Owner-side reclamation**: `retire(id)` and `retire_all()` promote every surviving lease in
-  place and release the segment unconditionally. `maintain(min_wasted_bytes)` retires segments
-  once their wasted (retained minus live loaned) bytes reach a threshold.
+  place and release the segment unconditionally — without ever blocking on active readers.
+  `maintain(min_wasted_bytes)` retires segments once their wasted (retained minus live loaned)
+  bytes reach a threshold.
 - **O(1) retirement checks**: each lease's pin is tracked in a shared per-segment live-byte
   counter, decremented automatically when a lease is dropped or promoted, so `maintain` never has
-  to walk the lease registry to decide.
+  to walk the lease registry to decide whether retiring pays off (its registry-pruning pass still
+  touches each registration).
 - **Consumer-side promotion**: `lease.promote()` takes the copy early and releases the pin without
   involving the store — useful at an ownership boundary such as a resolver or deserializer.
+- **Non-blocking reads**: `lease.bytes()` returns a snapshot guard holding its own pin, so guards
+  nest freely, never deadlock, and stay valid across concurrent promotion or retirement.
 - **Absolute spans**: segments are parked with a base offset, and `Span`s address bytes across the
   whole logical stream; `leases()` covers spans that straddle segment boundaries.
 - **Safe by refcounting**: dropping the `Store` without retiring never dangles a lease — loaned
   leases share ownership of their segment. Retirement is a memory-management action, not a safety
   requirement.
+- **Bounded bookkeeping**: lease registries prune themselves as leases are handed out, and the
+  tombstones of retired segments compact away once everything parked before them retires, so a
+  streaming park-and-retire loop runs in bounded memory.
 
 ## Usage
 
@@ -81,6 +88,29 @@ sweep cannot retire a buffer that was parked ahead of attaching its leases.
 `Store<B>` and `Lease<B>` are generic over any `B: AsRef<[u8]>` and default to `Vec<u8>`, so the
 crate has no dependencies and works with plain vectors, `Box<[u8]>`, memory-mapped buffers, or
 reader-owned buffer types.
+
+## Contracts and caveats
+
+Everything in the crate is safe code; breaking a contract degrades behavior (empty or truncated
+reads, delayed reclamation) but can never cause memory unsafety.
+
+- **Stable buffers.** `B::as_ref` must return the same slice — same address, length, and
+  contents — on every call. A misbehaving implementation safely degrades: reads whose validated
+  range no longer fits clamp to empty bytes, and a panicking `as_ref` leaves promotion retryable.
+- **Ascending bases.** Bases should be ascending and non-overlapping, as produced by parking
+  consecutive buffers of one stream. `park` does not validate this; single-segment lookups still
+  resolve out of order, but cross-segment spans conservatively resolve to `None`, and overlaps
+  resolve to the first-parked segment.
+- **Empty spans.** Zero-length spans — including reversed ones — resolve successfully against any
+  store and yield empty bytes; an empty lease starts owned and pins nothing.
+- **Thread safety.** `Lease<B>` and `Store<B>` are `Send`/`Sync` exactly when `B` is
+  `Send + Sync`. A `LeaseBytes` guard keeps the segment allocation alive on its own until dropped,
+  even across retirement, so drop guards promptly rather than storing them.
+- **Advisory accounting.** Live-byte counters count lease ranges with multiplicity (overlapping
+  leases each contribute fully) and saturate instead of wrapping; they steer `maintain` and are
+  not a precise measure of covered bytes.
+- **Identifier scope.** A `SegmentId` is only meaningful for the store that issued it; it stays
+  valid (reporting the segment's settled state) after retirement and compaction.
 
 ## Minimum Supported Rust Version
 

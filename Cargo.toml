@@ -3,6 +3,7 @@ name = "strata-lease"
 version = "0.1.0"
 edition = "2024"
 repository = "https://codeberg.org/Devious-Concepts/strata-lease"
+documentation = "https://docs.rs/strata-lease"
 rust-version = "1.87.0"
 description = "Revocable zero-copy sharing: promotable leases into retained byte buffers"
 keywords = ["zero-copy", "buffer", "lease", "memory", "sharing"]
@@ -11,9 +12,14 @@ license = "MPL-2.0"
 readme = "README.md"
 include = [
   "src/lease.rs",
+  "src/lease/tests.rs",
   "src/lib.rs",
   "src/span.rs",
+  "src/span/tests.rs",
   "src/store.rs",
+  "src/store/tests.rs",
+  "tests/consumer.rs",
+  "tests/hardening.rs",
   "Cargo.toml",
   "Cargo.lock",
   "CHANGELOG.md",
@@ -28,6 +34,7 @@ nonstandard_style = { level = "warn", priority = -1 }
 rust_2018_idioms = { level = "warn", priority = -1 }
 unused = { level = "warn", priority = -1 }
 
+missing_docs = "warn"
 unexpected_cfgs = "warn"
 unsafe_code = "deny"
 

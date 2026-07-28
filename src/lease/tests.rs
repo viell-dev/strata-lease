@@ -32,12 +32,42 @@ fn lease_reads_uniformly_before_and_after_promotion() {
 }
 
 #[test]
-fn empty_span_lease_is_empty() {
+fn empty_span_lease_is_owned_and_pins_nothing() {
     let (_store, lease) = leased("abc", Span::new(1, 1));
 
+    assert!(lease.is_owned());
     assert_eq!(lease.len(), 0);
     assert!(lease.is_empty());
     assert_eq!(&*lease.bytes(), b"");
+}
+
+#[test]
+fn nested_guards_on_one_lease_do_not_deadlock() {
+    let (_store, lease) = leased("nested", Span::new(0, 6));
+
+    let first = lease.bytes();
+    let second = lease.bytes();
+
+    assert_eq!(&*first, b"nested");
+    assert_eq!(&*second, b"nested");
+    // Reads that internally take another guard stay legal while guards are held.
+    assert_eq!(lease.len(), 6);
+    assert_eq!(lease.to_vec(), b"nested".to_vec());
+}
+
+#[test]
+fn promotion_does_not_block_or_invalidate_active_guards() {
+    let (_store, lease) = leased("guarded", Span::new(0, 7));
+    let guard = lease.bytes();
+
+    lease.promote();
+
+    assert!(lease.is_owned());
+    assert_eq!(&*guard, b"guarded");
+
+    drop(guard);
+
+    assert_eq!(&*lease.bytes(), b"guarded");
 }
 
 #[test]

@@ -47,6 +47,30 @@
 //! assert_eq!(store.retained_len(), 0);
 //! ```
 //!
+//! # Contracts
+//!
+//! Everything in this crate is safe code; violating a contract below degrades behavior (empty or
+//! truncated reads, delayed reclamation) but can never cause memory unsafety.
+//!
+//! - **Stable buffers.** `Store<B>` accepts any `B: AsRef<[u8]>` and trusts that `as_ref` returns
+//!   the same slice — same address, same length, same contents — on every call. An impl that
+//!   mutates or swaps its slice between calls safely degrades: reads whose validated range no
+//!   longer fits clamp to empty bytes.
+//! - **Ascending bases.** Segment bases are expected to be ascending and non-overlapping, as
+//!   produced by parking consecutive buffers of one stream. [`Store::park`] does not validate
+//!   this; see [`Store`](Store#segment-ordering) for how lookups behave when it does not hold.
+//! - **Empty spans.** A [`Span`] with zero length — including a reversed one — resolves
+//!   successfully against any store and yields empty bytes; an empty lease starts owned and pins
+//!   nothing.
+//! - **Thread safety.** [`Lease<B>`] and [`Store<B>`] are `Send`/`Sync` exactly when `B` is
+//!   `Send + Sync`. Reads never block promotion or retirement: a [`LeaseBytes`] guard snapshots
+//!   its own pin on the allocation, so guards nest freely and retirement completes immediately
+//!   even while readers are active — the allocation itself is freed when the last outstanding
+//!   guard drops.
+//! - **Advisory accounting.** Per-segment live-byte counters count lease ranges with
+//!   multiplicity (overlapping leases each contribute fully), saturate instead of wrapping, and
+//!   only steer [`Store::maintain`]; they are not a precise measure of covered bytes.
+//!
 //! # Crate organization
 //!
 //! - [`Store`]: the owner side; parks segments, hands out leases, and decides when to retire.
@@ -61,3 +85,8 @@ mod store;
 pub use lease::{Lease, LeaseBytes};
 pub use span::Span;
 pub use store::{SegmentId, Store};
+
+/// Compile-checks the README examples alongside the doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
