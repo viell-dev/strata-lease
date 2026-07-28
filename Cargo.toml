@@ -23,7 +23,10 @@ include = [
   "Cargo.toml",
   "Cargo.lock",
   "CHANGELOG.md",
+  "CONTRIBUTING.md",
   "LICENSE",
+  "LICENSE-CLARIFICATION.md",
+  "LICENSE-MIT-0",
   "README.md",
   "rust-toolchain.toml",
 ]
