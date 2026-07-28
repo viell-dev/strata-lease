@@ -183,26 +183,21 @@ impl<B: AsRef<[u8]>> Store<B> {
         Some(lease)
     }
 
-    /// Creates leases covering `span` across consecutive retained segments.
-    ///
-    /// Spans that fit one segment yield a single lease. Returns `None` when any part of the span
-    /// is not retained; an empty span yields an empty vector.
-    pub fn leases(&mut self, span: Span) -> Option<Vec<Lease<B>>> {
+    /// Maps `span` onto retained segments as `(segment index, range)` pairs covering the whole
+    /// span in park order.
+    fn ranges(&self, span: Span) -> Option<Vec<(usize, Range<usize>)>> {
         if span.end < span.start {
             return None;
         }
 
         let mut cursor = span.start;
-        let mut collected = Vec::new();
+        let mut ranges = Vec::new();
 
-        for index in 0..self.segments.len() {
+        for (index, entry) in self.segments.iter().enumerate() {
             if cursor >= span.end {
                 break;
             }
 
-            let Some(entry) = self.segments.get_mut(index) else {
-                break;
-            };
             let Some(bytes) = entry.bytes.as_ref() else {
                 continue;
             };
@@ -220,17 +215,46 @@ impl<B: AsRef<[u8]>> Store<B> {
             let stop = span.end.min(end);
             let start = usize::try_from(cursor.checked_sub(entry.base)?).ok()?;
             let stop_offset = usize::try_from(stop.checked_sub(entry.base)?).ok()?;
-            let (lease, registration) = Lease::loaned(
-                Arc::clone(bytes),
-                start..stop_offset,
-                Arc::clone(&entry.live_bytes),
-            );
-            entry.leases.push(registration);
-            collected.push(lease);
+            ranges.push((index, start..stop_offset));
             cursor = stop;
         }
 
-        (cursor == span.end).then_some(collected)
+        (cursor == span.end).then_some(ranges)
+    }
+
+    /// Copies bytes for `span` into a vector, following spans across segment boundaries.
+    ///
+    /// This is the read-only counterpart of [`Self::leases`] for callers that want bytes without
+    /// creating a handle. Returns `None` when any part of the span is not retained.
+    pub fn copy_bytes(&self, span: Span) -> Option<Vec<u8>> {
+        let ranges = self.ranges(span)?;
+        let mut bytes = Vec::new();
+
+        for (index, range) in ranges {
+            let entry = self.segments.get(index)?;
+            bytes.extend_from_slice((**entry.bytes.as_ref()?).as_ref().get(range)?);
+        }
+
+        Some(bytes)
+    }
+
+    /// Creates leases covering `span` across consecutive retained segments.
+    ///
+    /// Spans that fit one segment yield a single lease. Returns `None` when any part of the span
+    /// is not retained; an empty span yields an empty vector.
+    pub fn leases(&mut self, span: Span) -> Option<Vec<Lease<B>>> {
+        let ranges = self.ranges(span)?;
+        let mut collected = Vec::with_capacity(ranges.len());
+
+        for (index, range) in ranges {
+            let entry = self.segments.get_mut(index)?;
+            let bytes = Arc::clone(entry.bytes.as_ref()?);
+            let (lease, registration) = Lease::loaned(bytes, range, Arc::clone(&entry.live_bytes));
+            entry.leases.push(registration);
+            collected.push(lease);
+        }
+
+        Some(collected)
     }
 
     /// Retires `segment`: every surviving lease is promoted to its own copy in place, then the

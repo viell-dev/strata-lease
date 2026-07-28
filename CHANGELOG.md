@@ -14,8 +14,9 @@ byte buffers through promotable leases.
 
 - `Store<B>`, the owner side: parks byte segments with absolute base offsets
   (`park`, `park_open`, `seal`), resolves absolute `Span`s to zero-copy bytes
-  (`bytes`), and hands out promotable leases (`lease`, plus `leases` for spans
-  crossing segment boundaries).
+  (`bytes`) or handle-free copies across segment boundaries (`copy_bytes`), and
+  hands out promotable leases (`lease`, plus `leases` for spans crossing
+  segment boundaries).
 - `Lease<B>`, the consumer side: a cheap, cloneable, thread-safe handle that is
   either loaned (reads from the retained segment it pins) or owned (holds its
   own copy). `bytes()` reads uniformly in both states through the `LeaseBytes`

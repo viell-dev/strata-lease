@@ -202,6 +202,17 @@ fn leases_can_cross_segment_boundaries() {
 }
 
 #[test]
+fn copy_bytes_follows_fragmented_spans() {
+    let mut store = Store::new();
+    store.park(0, b"alpha".to_vec());
+    store.park(5, b"beta".to_vec());
+
+    assert_eq!(store.copy_bytes(Span::new(3, 7)), Some(b"habe".to_vec()));
+    assert_eq!(store.copy_bytes(Span::new(0, 5)), Some(b"alpha".to_vec()));
+    assert!(store.copy_bytes(Span::new(3, 20)).is_none());
+}
+
+#[test]
 fn leases_with_a_gap_resolve_to_none_and_unpin() {
     let mut store = Store::new();
     let first = store.park(0, b"alpha".to_vec());
