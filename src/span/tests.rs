@@ -55,3 +55,23 @@ fn errors_display_their_bounds() {
         "span end 2 precedes its start 6"
     );
 }
+
+#[test]
+fn segment_range_maps_contained_spans() {
+    let Some(range) = span(102, 104).segment_range(100, 5) else {
+        panic!("contained span should map");
+    };
+
+    assert_eq!(range.bounds(), 2..4);
+    assert_eq!(range.len(), 2);
+}
+
+#[test]
+fn segment_range_rejects_uncontained_spans() {
+    // Starts before the segment.
+    assert_eq!(span(99, 102).segment_range(100, 5), None);
+    // Ends past the segment.
+    assert_eq!(span(103, 106).segment_range(100, 5), None);
+    // Segment end would overflow the address space.
+    assert_eq!(span(0, 1).segment_range(u64::MAX, 2), None);
+}

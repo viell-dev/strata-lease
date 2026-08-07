@@ -1,11 +1,10 @@
 //! The owner side: retained segments, the lease registry, and retirement.
 
 use crate::lease::{Lease, Slot};
-use crate::span::Span;
+use crate::span::{SegmentRange, Span};
 use std::collections::VecDeque;
 use std::error;
 use std::fmt::{self, Debug, Display, Formatter};
-use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -167,18 +166,8 @@ impl<B: AsRef<[u8]>> Retained<B> {
     }
 
     /// Maps `span` to a range inside this segment when the segment fully contains it.
-    fn range_for(&self, span: Span) -> Option<Range<usize>> {
-        let len = u64::try_from(self.len()).ok()?;
-        let end = self.base.checked_add(len)?;
-
-        if span.start() < self.base || span.end() > end {
-            return None;
-        }
-
-        let start = usize::try_from(span.start().checked_sub(self.base)?).ok()?;
-        let stop = usize::try_from(span.end().checked_sub(self.base)?).ok()?;
-
-        Some(start..stop)
+    fn range_for(&self, span: Span) -> Option<SegmentRange> {
+        span.segment_range(self.base, self.len())
     }
 }
 
@@ -434,7 +423,7 @@ impl<B: AsRef<[u8]>> Store<B> {
         self.segments.iter().find_map(|entry| {
             let retained = entry.retained()?;
             let range = retained.range_for(span)?;
-            (*retained.bytes).as_ref().get(range)
+            (*retained.bytes).as_ref().get(range.bounds())
         })
     }
 
@@ -463,7 +452,7 @@ impl<B: AsRef<[u8]>> Store<B> {
     /// Maps `span` onto retained segments as `(position, range)` pairs covering the whole span in
     /// park order. Positions index `self.segments` directly and are only valid until the next
     /// mutation.
-    fn ranges(&self, span: Span) -> Option<Vec<(usize, Range<usize>)>> {
+    fn ranges(&self, span: Span) -> Option<Vec<(usize, SegmentRange)>> {
         let mut cursor = span.start();
         let mut ranges = Vec::new();
 
@@ -486,10 +475,13 @@ impl<B: AsRef<[u8]>> Store<B> {
                 return None;
             }
 
+            // Non-empty by the loop guard (`cursor < span.end()`) and `cursor < end`.
             let stop = span.end().min(end);
-            let start = usize::try_from(cursor.checked_sub(retained.base)?).ok()?;
-            let stop_offset = usize::try_from(stop.checked_sub(retained.base)?).ok()?;
-            ranges.push((position, start..stop_offset));
+            let piece = Span::new(cursor, stop).ok()?;
+            ranges.push((
+                position,
+                piece.segment_range(retained.base, retained.len())?,
+            ));
             cursor = stop;
         }
 
@@ -507,7 +499,7 @@ impl<B: AsRef<[u8]>> Store<B> {
 
         for (position, range) in ranges {
             let retained = self.segments.get(position)?.retained()?;
-            bytes.extend_from_slice((*retained.bytes).as_ref().get(range)?);
+            bytes.extend_from_slice((*retained.bytes).as_ref().get(range.bounds())?);
         }
 
         Some(bytes)

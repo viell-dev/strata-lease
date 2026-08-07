@@ -1,7 +1,8 @@
 //! Promotable lease handles into retained segments.
 
+use crate::span::SegmentRange;
 use std::fmt::{self, Debug, Formatter};
-use std::ops::{Deref, Range};
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
@@ -35,12 +36,12 @@ fn unpin(live_bytes: &AtomicUsize, len: usize) {
 /// never neither, even when a buffer's `as_ref` panics mid-copy.
 pub(crate) struct Slot<B> {
     owned: OnceLock<Box<[u8]>>,
-    source: Mutex<Option<(Arc<B>, Range<usize>)>>,
+    source: Mutex<Option<(Arc<B>, SegmentRange)>>,
     live_bytes: Arc<AtomicUsize>,
 }
 
 impl<B> Slot<B> {
-    fn lock_source(&self) -> MutexGuard<'_, Option<(Arc<B>, Range<usize>)>> {
+    fn lock_source(&self) -> MutexGuard<'_, Option<(Arc<B>, SegmentRange)>> {
         self.source.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -66,7 +67,7 @@ impl<B: AsRef<[u8]>> Slot<B> {
             return;
         };
 
-        let bytes = (**segment).as_ref().get(range.clone()).unwrap_or(&[]);
+        let bytes = (**segment).as_ref().get(range.bounds()).unwrap_or(&[]);
         /* Setting can only fail if `owned` is already initialized, which cannot happen: every
         setter holds the source lock and requires the source to still be present, and it was
         still present above. */
@@ -131,7 +132,7 @@ impl<B> Lease<B> {
     /// to find the lease again at retirement.
     pub(crate) fn loaned(
         segment: Arc<B>,
-        range: Range<usize>,
+        range: SegmentRange,
         live_bytes: Arc<AtomicUsize>,
     ) -> (Self, Weak<Slot<B>>) {
         pin(&live_bytes, range.len());
@@ -200,7 +201,7 @@ impl<B: AsRef<[u8]>> Lease<B> {
             return LeaseBytes {
                 inner: Inner::Loaned {
                     segment: Arc::clone(segment),
-                    range: range.clone(),
+                    range: *range,
                 },
             };
         }
@@ -245,7 +246,7 @@ enum Inner<'a, B> {
     Owned(&'a [u8]),
     Loaned {
         segment: Arc<B>,
-        range: Range<usize>,
+        range: SegmentRange,
     },
 }
 
@@ -256,7 +257,7 @@ impl<B: AsRef<[u8]>> Deref for LeaseBytes<'_, B> {
         match &self.inner {
             Inner::Owned(bytes) => bytes,
             Inner::Loaned { segment, range } => {
-                (**segment).as_ref().get(range.clone()).unwrap_or(&[])
+                (**segment).as_ref().get(range.bounds()).unwrap_or(&[])
             }
         }
     }

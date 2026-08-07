@@ -94,6 +94,55 @@ impl Span {
     pub const fn len(self) -> u64 {
         self.end - self.start
     }
+
+    /// Maps this span into a segment parked at `base` holding `len` bytes.
+    ///
+    /// Returns the segment-relative range when the segment fully contains the span, `None`
+    /// otherwise (including when `base + len` overflows the address space). This is the only
+    /// constructor of [`SegmentRange`], so every value that exists indexes a validated
+    /// containment.
+    pub(crate) fn segment_range(self, base: u64, len: usize) -> Option<SegmentRange> {
+        let segment_len = u64::try_from(len).ok()?;
+        let segment_end = base.checked_add(segment_len)?;
+
+        if self.start < base || self.end > segment_end {
+            return None;
+        }
+
+        let start = usize::try_from(self.start.checked_sub(base)?).ok()?;
+        let end = usize::try_from(self.end.checked_sub(base)?).ok()?;
+
+        Some(SegmentRange { start, end })
+    }
+}
+
+/// A non-empty, forward byte range inside one retained segment, relative to the segment's base.
+///
+/// This is the segment-local counterpart of [`Span`]: `usize` slice indices instead of absolute
+/// `u64` stream offsets. Values only come from [`Span::segment_range`], so `start < end` and
+/// `end` is within the segment length measured at construction; unlike `Range<usize>` it is
+/// `Copy`. Reads through it still clamp defensively, because an unstable buffer may have shrunk
+/// since the containment was validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmentRange {
+    start: usize,
+    end: usize,
+}
+
+impl SegmentRange {
+    /// Returns the number of bytes the range covers; always at least one.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "start < end by construction"
+    )]
+    pub(crate) const fn len(self) -> usize {
+        self.end - self.start
+    }
+
+    /// Returns the range as slice bounds.
+    pub(crate) const fn bounds(self) -> Range<usize> {
+        self.start..self.end
+    }
 }
 
 impl TryFrom<Range<u64>> for Span {
