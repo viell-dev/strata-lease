@@ -1,6 +1,6 @@
 //! The owner side: retained segments, the lease registry, and retirement.
 
-use crate::lease::{Lease, Slot};
+use crate::lease::{Backing, Lease, Slot};
 use crate::span::{SegmentRange, Span};
 use std::collections::VecDeque;
 use std::error;
@@ -134,13 +134,20 @@ impl<B> Segment<B> {
 struct Retained<B> {
     /// The absolute span the segment covers, validated at parking.
     span: Span,
-    bytes: Arc<B>,
+    backing: Arc<Backing<B>>,
     sealed: bool,
     leases: Vec<Weak<Slot<B>>>,
-    live_bytes: Arc<AtomicUsize>,
 }
 
 impl<B> Retained<B> {
+    /// Segment length in bytes, from the span validated at parking.
+    ///
+    /// The length originated as a buffer's `usize` length at parking, so the narrowing cannot
+    /// actually fail; the saturating fallback only satisfies the lint.
+    fn len(&self) -> usize {
+        usize::try_from(self.span.len()).unwrap_or(usize::MAX)
+    }
+
     /// Drops registry entries whose lease is gone or already promoted.
     fn prune(&mut self) {
         self.leases
@@ -154,8 +161,7 @@ impl<B> Retained<B> {
     /// with amortized O(1) cost, even when the owner never calls
     /// [`maintain`](crate::Store::maintain).
     fn lease(&mut self, range: SegmentRange) -> Lease<B> {
-        let (lease, registration) =
-            Lease::loaned(Arc::clone(&self.bytes), range, Arc::clone(&self.live_bytes));
+        let (lease, registration) = Lease::loaned(Arc::clone(&self.backing), range);
 
         if self.leases.len() == self.leases.capacity() {
             self.prune();
@@ -163,12 +169,6 @@ impl<B> Retained<B> {
 
         self.leases.push(registration);
         lease
-    }
-}
-
-impl<B: AsRef<[u8]>> Retained<B> {
-    fn len(&self) -> usize {
-        (*self.bytes).as_ref().len()
     }
 }
 
@@ -269,9 +269,9 @@ impl<B> Store<B> {
         }
 
         self.entry(segment).map(|entry| {
-            entry
-                .retained()
-                .map_or(0, |retained| retained.live_bytes.load(Ordering::Relaxed))
+            entry.retained().map_or(0, |retained| {
+                retained.backing.live_bytes.load(Ordering::Relaxed)
+            })
         })
     }
 
@@ -316,6 +316,25 @@ impl<B> Store<B> {
         }
 
         true
+    }
+
+    /// Returns the total retained bytes across parked segments, saturating at `usize::MAX`.
+    #[must_use]
+    pub fn retained_len(&self) -> usize {
+        self.segments.iter().fold(0usize, |total, entry| {
+            total.saturating_add(entry.retained().map_or(0, Retained::len))
+        })
+    }
+
+    /// Returns the absolute span a still-retained segment covers.
+    ///
+    /// Returns `None` for unknown or retired segments; every retained segment carries the span
+    /// validated at parking.
+    #[must_use]
+    pub fn segment_span(&self, segment: SegmentId) -> Option<Span> {
+        self.entry(segment)?
+            .retained()
+            .map(|retained| retained.span)
     }
 }
 
@@ -389,32 +408,15 @@ impl<B: AsRef<[u8]>> Store<B> {
         self.high_water = span.end();
         self.segments.push_back(Segment::Retained(Retained {
             span,
-            bytes: Arc::new(bytes),
+            backing: Arc::new(Backing {
+                bytes,
+                live_bytes: AtomicUsize::new(0),
+            }),
             sealed,
             leases: Vec::new(),
-            live_bytes: Arc::new(AtomicUsize::new(0)),
         }));
 
         Ok(id)
-    }
-
-    /// Returns the total retained bytes across parked segments, saturating at `usize::MAX`.
-    #[must_use]
-    pub fn retained_len(&self) -> usize {
-        self.segments.iter().fold(0usize, |total, entry| {
-            total.saturating_add(entry.retained().map_or(0, Retained::len))
-        })
-    }
-
-    /// Returns the absolute span a still-retained segment covers.
-    ///
-    /// Returns `None` for unknown or retired segments; every retained segment carries the span
-    /// validated at parking.
-    #[must_use]
-    pub fn segment_span(&self, segment: SegmentId) -> Option<Span> {
-        self.entry(segment)?
-            .retained()
-            .map(|retained| retained.span)
     }
 
     /// Returns bytes for `span` when one retained segment fully contains it.
@@ -427,7 +429,7 @@ impl<B: AsRef<[u8]>> Store<B> {
         self.segments.iter().find_map(|entry| {
             let retained = entry.retained()?;
             let range = span.segment_range(retained.span)?;
-            (*retained.bytes).as_ref().get(range.bounds())
+            retained.backing.bytes.as_ref().get(range.bounds())
         })
     }
 
@@ -491,7 +493,7 @@ impl<B: AsRef<[u8]>> Store<B> {
 
         for (position, range) in ranges {
             let retained = self.segments.get(position)?.retained()?;
-            bytes.extend_from_slice((*retained.bytes).as_ref().get(range.bounds())?);
+            bytes.extend_from_slice(retained.backing.bytes.as_ref().get(range.bounds())?);
         }
 
         Some(bytes)
@@ -579,7 +581,7 @@ impl<B: AsRef<[u8]>> Store<B> {
                 continue;
             }
 
-            let live = retained.live_bytes.load(Ordering::Relaxed);
+            let live = retained.backing.live_bytes.load(Ordering::Relaxed);
 
             if retained.len().saturating_sub(live) >= min_wasted_bytes {
                 retirable.push(compacted.saturating_add(position));
@@ -617,7 +619,10 @@ impl<B> Debug for Segment<B> {
                 .field("span", &retained.span)
                 .field("sealed", &retained.sealed)
                 .field("registered_leases", &retained.leases.len())
-                .field("live_bytes", &retained.live_bytes.load(Ordering::Relaxed))
+                .field(
+                    "live_bytes",
+                    &retained.backing.live_bytes.load(Ordering::Relaxed),
+                )
                 .finish_non_exhaustive(),
             Self::Retired => f.write_str("Retired"),
         }

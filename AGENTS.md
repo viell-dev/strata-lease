@@ -23,19 +23,22 @@ Single-crate library with three private modules, all re-exported at the crate ro
   reversed spans are unrepresentable; the store never has to special-case them. `SegmentRange` is
   the segment-local counterpart (`Copy`, non-empty, forward `usize` slice bounds) and is only
   constructible through `Span::segment_range`, the containment check itself.
-- **`lease`**, `Lease` / `LeaseBytes` and the crate-internal `Slot`: the consumer-side promotable
-  handle. A `Slot` holds `owned: OnceLock<Box<[u8]>>`,
-  `source: Mutex<Option<(Arc<B>, SegmentRange)>>`, and a shared `Arc<AtomicUsize>` live-byte
-  counter (saturating, advisory). The pin on a segment is the `Arc<B>` in `source`; whoever takes
-  it out of the mutex (promotion or `Slot::drop`) decrements the counter exactly once. Promotion copies under the lock *before* taking the
+- **`lease`**, `Lease` / `LeaseBytes` and the crate-internal `Slot` / `Backing`: the
+  consumer-side promotable handle. `Backing<B>` bundles a segment's bytes with its live-byte
+  counter (saturating stickily, advisory) in one allocation, so a lease can never be wired to one
+  segment's bytes and another's counter. A `Slot` holds `owned: OnceLock<Arc<[u8]>>` and
+  `source: Mutex<Option<(Arc<Backing<B>>, SegmentRange)>>`. The pin on a segment is the
+  `Arc<Backing<B>>` in `source`; whoever takes it out of the mutex (promotion or `Slot::drop`)
+  decrements the counter exactly once. Promotion copies under the lock *before* taking the
   source, so a panicking buffer `as_ref` leaves the lease loaned and retryable. `LeaseBytes` is a
-  snapshot guard: it clones the `Arc<B>` and range out of the mutex instead of holding it, so
-  reads never block promotion or retirement and guards nest freely.
+  lifetime-free snapshot guard: it clones an `Arc` (backing or promoted copy) instead of
+  borrowing or locking, so reads never block promotion or retirement, guards nest freely, and a
+  guard may outlive both the lease and the store.
 - **`store`**, `Store` / `SegmentId` / `ParkError` / `ParkErrorKind`: the owner side. Segments
   live in a `VecDeque` behind a `compacted` offset as a `Segment` enum: `Retained` (with the
-  absolute `Span` validated at parking, `Arc<B>` bytes, a `Vec<Weak<Slot<B>>>` lease registry
-  pruned amortized on insert and by `maintain`, the shared live-byte counter, and a `sealed`
-  flag) or a bare `Retired` tombstone,
+  absolute `Span` validated at parking, the shared `Arc<Backing<B>>`, a `Vec<Weak<Slot<B>>>`
+  lease registry pruned amortized on insert and by `maintain`, and a `sealed` flag) or a bare
+  `Retired` tombstone,
   so retired segments cannot carry stale bookkeeping. `park` validates against the store's
   `high_water` offset — buffers must be non-empty, in ascending non-overlapping base order, and
   `u64`-addressable — and rejects violations with a `ParkError` carrying the buffer back.

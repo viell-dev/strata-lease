@@ -34,21 +34,30 @@ fn unpin(live_bytes: &AtomicUsize, len: usize) {
     });
 }
 
+/// A retained segment's shared allocation: the buffer plus its live-byte counter.
+///
+/// The counter lives inside the same allocation as the bytes it accounts for, so a lease can
+/// never be wired to one segment's bytes and another segment's counter, and pinning a segment is
+/// one `Arc` instead of two.
+pub(crate) struct Backing<B> {
+    pub(crate) bytes: B,
+    pub(crate) live_bytes: AtomicUsize,
+}
+
 /// Shared state behind one lease and all of its clones.
 ///
-/// The pin on the source segment is the `Arc<B>` inside `source`. Exactly one path releases it:
-/// whoever takes the `Option` out of the mutex also subtracts the range length from the shared
-/// live-byte counter. `owned` is only ever initialized while that mutex is held and *before* the
-/// source is taken, so a live slot always has a source, an owned copy, or both mid-promotion —
-/// never neither, even when a buffer's `as_ref` panics mid-copy.
+/// The pin on the source segment is the `Arc<Backing<B>>` inside `source`. Exactly one path
+/// releases it: whoever takes the `Option` out of the mutex also subtracts the range length from
+/// the backing's live-byte counter. `owned` is only ever initialized while that mutex is held and
+/// *before* the source is taken, so a live slot always has a source, an owned copy, or both
+/// mid-promotion — never neither, even when a buffer's `as_ref` panics mid-copy.
 pub(crate) struct Slot<B> {
-    owned: OnceLock<Box<[u8]>>,
-    source: Mutex<Option<(Arc<B>, SegmentRange)>>,
-    live_bytes: Arc<AtomicUsize>,
+    owned: OnceLock<Arc<[u8]>>,
+    source: Mutex<Option<(Arc<Backing<B>>, SegmentRange)>>,
 }
 
 impl<B> Slot<B> {
-    fn lock_source(&self) -> MutexGuard<'_, Option<(Arc<B>, SegmentRange)>> {
+    fn lock_source(&self) -> MutexGuard<'_, Option<(Arc<Backing<B>>, SegmentRange)>> {
         self.source.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -70,21 +79,21 @@ impl<B: AsRef<[u8]>> Slot<B> {
     /// functional instead of silently empty.
     pub(crate) fn promote(&self) {
         let mut source = self.lock_source();
-        let Some((segment, range)) = source.as_ref() else {
+        let Some((backing, range)) = source.as_ref() else {
             return;
         };
 
-        let bytes = (**segment).as_ref().get(range.bounds()).unwrap_or(&[]);
+        let bytes = backing.bytes.as_ref().get(range.bounds()).unwrap_or(&[]);
         /* Setting can only fail if `owned` is already initialized, which cannot happen: every
         setter holds the source lock and requires the source to still be present, and it was
         still present above. */
-        let _ = self.owned.set(Box::from(bytes));
+        let _ = self.owned.set(Arc::from(bytes));
 
-        let Some((_, range)) = source.take() else {
+        let Some((backing, range)) = source.take() else {
             return;
         };
         drop(source);
-        unpin(&self.live_bytes, range.len());
+        unpin(&backing.live_bytes, range.len());
     }
 }
 
@@ -95,8 +104,8 @@ impl<B> Drop for Slot<B> {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner);
 
-        if let Some((_, range)) = source.take() {
-            unpin(&self.live_bytes, range.len());
+        if let Some((backing, range)) = source.take() {
+            unpin(&backing.live_bytes, range.len());
         }
     }
 }
@@ -135,18 +144,13 @@ impl<B> Debug for Lease<B> {
 }
 
 impl<B> Lease<B> {
-    /// Creates a loaned lease pinning `range` of `segment`, plus the registration the store keeps
-    /// to find the lease again at retirement.
-    pub(crate) fn loaned(
-        segment: Arc<B>,
-        range: SegmentRange,
-        live_bytes: Arc<AtomicUsize>,
-    ) -> (Self, Weak<Slot<B>>) {
-        pin(&live_bytes, range.len());
+    /// Creates a loaned lease pinning `range` of `backing`, plus the registration the store
+    /// keeps to find the lease again at retirement.
+    pub(crate) fn loaned(backing: Arc<Backing<B>>, range: SegmentRange) -> (Self, Weak<Slot<B>>) {
+        pin(&backing.live_bytes, range.len());
         let slot = Arc::new(Slot {
             owned: OnceLock::new(),
-            source: Mutex::new(Some((segment, range))),
-            live_bytes,
+            source: Mutex::new(Some((backing, range))),
         });
         let registration = Arc::downgrade(&slot);
 
@@ -195,19 +199,19 @@ impl<B: AsRef<[u8]>> Lease<B> {
     /// the read is done rather than storing it long-term; the lease itself is the cheap handle to
     /// keep.
     #[must_use]
-    pub fn bytes(&self) -> LeaseBytes<'_, B> {
+    pub fn bytes(&self) -> LeaseBytes<B> {
         if let Some(owned) = self.slot.owned.get() {
             return LeaseBytes {
-                inner: Inner::Owned(owned),
+                inner: Inner::Owned(Arc::clone(owned)),
             };
         }
 
         let source = self.slot.lock_source();
 
-        if let Some((segment, range)) = source.as_ref() {
+        if let Some((backing, range)) = source.as_ref() {
             return LeaseBytes {
                 inner: Inner::Loaned {
-                    segment: Arc::clone(segment),
+                    backing: Arc::clone(backing),
                     range: *range,
                 },
             };
@@ -218,7 +222,7 @@ impl<B: AsRef<[u8]>> Lease<B> {
         /* The source was already released, so the promotion that released it has completed and
         `owned` is initialized; the empty fallback is unreachable. */
         LeaseBytes {
-            inner: Inner::Owned(self.slot.owned.get().map_or(&[][..], |bytes| bytes)),
+            inner: Inner::Owned(self.slot.owned.get().cloned().unwrap_or_default()),
         }
     }
 
@@ -241,42 +245,42 @@ impl<B: AsRef<[u8]>> Lease<B> {
 
 /// Zero-copy read guard returned by [`Lease::bytes`].
 ///
-/// Dereferences to the lease's byte slice in both lease states. For a loaned lease the guard
-/// holds its own pin on the segment allocation (an `Arc` clone, not a lock), so it stays valid —
-/// and keeps that allocation alive — across promotion, retirement, and even dropping the lease
-/// and the store.
-pub struct LeaseBytes<'a, B = Vec<u8>> {
-    inner: Inner<'a, B>,
+/// Dereferences to the lease's byte slice in both lease states. The guard is a self-contained
+/// snapshot — a pin on the segment allocation for a loaned lease, a share of the promoted copy
+/// for an owned one (an `Arc` clone either way, never a borrow or a lock) — so it stays valid
+/// across promotion and retirement, and even outlives the lease and the store.
+pub struct LeaseBytes<B = Vec<u8>> {
+    inner: Inner<B>,
 }
 
-enum Inner<'a, B> {
-    Owned(&'a [u8]),
+enum Inner<B> {
+    Owned(Arc<[u8]>),
     Loaned {
-        segment: Arc<B>,
+        backing: Arc<Backing<B>>,
         range: SegmentRange,
     },
 }
 
-impl<B: AsRef<[u8]>> Deref for LeaseBytes<'_, B> {
+impl<B: AsRef<[u8]>> Deref for LeaseBytes<B> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
         match &self.inner {
             Inner::Owned(bytes) => bytes,
-            Inner::Loaned { segment, range } => {
-                (**segment).as_ref().get(range.bounds()).unwrap_or(&[])
+            Inner::Loaned { backing, range } => {
+                backing.bytes.as_ref().get(range.bounds()).unwrap_or(&[])
             }
         }
     }
 }
 
-impl<B: AsRef<[u8]>> AsRef<[u8]> for LeaseBytes<'_, B> {
+impl<B: AsRef<[u8]>> AsRef<[u8]> for LeaseBytes<B> {
     fn as_ref(&self) -> &[u8] {
         self
     }
 }
 
-impl<B: AsRef<[u8]>> Debug for LeaseBytes<'_, B> {
+impl<B: AsRef<[u8]>> Debug for LeaseBytes<B> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Debug::fmt(&**self, f)
     }

@@ -44,10 +44,11 @@ audit.
 
 ### Changed
 
-- `LeaseBytes` is a snapshot guard: it takes its own pin on the segment
-  allocation instead of holding the lease's internal lock, so guards nest
-  freely, never deadlock, stay valid across promotion and retirement, and
-  retirement never blocks on active readers.
+- `LeaseBytes` is a lifetime-free snapshot guard: it holds its own `Arc` on
+  the segment allocation (or the promoted copy) instead of borrowing the lease
+  or holding its internal lock, so guards nest freely, never deadlock, stay
+  valid across promotion and retirement — outliving even the lease and the
+  store — and retirement never blocks on active readers.
 - Invalid states are rejected at construction instead of resolved leniently at
   lookup: empty and reversed spans are unrepresentable, misparked segments
   (empty, out of base order, or overflowing the `u64` address space) never
@@ -59,8 +60,9 @@ audit.
 - Lease registries prune dropped and promoted registrations amortized on
   insert, keeping them proportional to the live loaned leases even when
   `maintain` is never called.
-- Live-byte counters saturate instead of wrapping, keeping pathological
-  aggregate lease lengths from corrupting maintenance decisions.
+- Live-byte counters saturate stickily instead of wrapping, keeping
+  pathological aggregate lease lengths from corrupting maintenance decisions
+  in either direction.
 - `Debug` for `Store` no longer requires `B: Debug` and reports per-segment
   bookkeeping (base, retired, sealed, registered leases, live bytes).
 
