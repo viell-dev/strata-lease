@@ -29,8 +29,7 @@ fn parked(text: &str) -> (Store, SegmentId) {
 fn parked_segment_resolves_span_bytes() {
     let (store, _) = parked("key=value\n");
 
-    assert_eq!(store.len(), 1);
-    assert!(!store.is_empty());
+    assert_eq!(store.segment_count(), 1);
     assert_eq!(store.retained_len(), 10);
     assert_eq!(store.bytes(span(4, 9)), Some(b"value".as_slice()));
     assert_eq!(store.bytes(span(4, 20)), None);
@@ -63,7 +62,7 @@ fn park_rejects_empty_buffers() {
     };
 
     assert_eq!(error.kind(), ParkErrorKind::Empty);
-    assert!(store.is_empty());
+    assert_eq!(store.segment_count(), 0);
     assert_eq!(error.into_bytes(), Vec::<u8>::new());
 }
 
@@ -83,7 +82,7 @@ fn park_rejects_out_of_order_bases_and_returns_the_buffer() {
         }
     );
     assert_eq!(error.into_bytes(), b"beta".to_vec());
-    assert_eq!(store.len(), 1);
+    assert_eq!(store.segment_count(), 1);
     assert_eq!(store.retained_len(), 5);
 }
 
@@ -119,7 +118,7 @@ fn park_rejects_unaddressable_tails() {
 
     assert_eq!(error.kind(), ParkErrorKind::Unaddressable { base, len: 6 });
     assert_eq!(store.retained_len(), 0);
-    assert!(store.is_empty());
+    assert_eq!(store.segment_count(), 0);
 }
 
 #[test]
@@ -367,7 +366,7 @@ fn retiring_in_order_compacts_tombstones_and_keeps_ids_stable() {
     assert_eq!(store.segments.len(), 1);
 
     // Identifiers stay valid and answer with their settled state.
-    assert_eq!(store.len(), 3);
+    assert_eq!(store.segment_count(), 3);
     assert_eq!(store.status(first), Some(SegmentStatus::Retired));
     assert_eq!(store.status(second), Some(SegmentStatus::Retired));
     assert_eq!(store.status(third), Some(SegmentStatus::Sealed));
@@ -392,7 +391,7 @@ fn streaming_park_and_retire_runs_in_bounded_memory() {
         assert!(store.segments.len() <= 1);
     }
 
-    assert_eq!(store.len(), 100);
+    assert_eq!(store.segment_count(), 100);
     assert_eq!(store.retained_len(), 0);
 }
 

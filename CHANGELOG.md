@@ -45,6 +45,12 @@ audit.
 
 ### Changed
 
+- Segment identifiers index with `u64`, so `SegmentId`s are never reused on
+  any target — each parked segment covers at least one byte, so the `u64`
+  address space bounds the number of parks — and the misleading
+  `len`/`is_empty` pair (which counted retired history, never shrinking) is
+  replaced by `segment_count()`.
+
 - `LeaseBytes` is a lifetime-free snapshot guard: it holds its own `Arc` on
   the segment allocation (or the promoted copy) instead of borrowing the lease
   or holding its internal lock, so guards nest freely, never deadlock, stay

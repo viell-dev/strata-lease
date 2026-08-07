@@ -11,17 +11,19 @@ use std::sync::{Arc, Weak};
 /// Identifier for a parked segment.
 ///
 /// Identifiers are assigned in park order, are never reused, and stay valid for the lifetime of
-/// the store that issued them — including after the segment is retired. They carry no store
-/// identity: passing an identifier to a *different* store is a logic error that safely resolves
-/// against whatever segment holds that position there.
+/// the store that issued them — including after the segment is retired. The index is `u64` so
+/// that no-reuse holds on every target: each parked segment covers at least one byte of the
+/// `u64` address space, which bounds the number of parks a store can ever accept. Identifiers
+/// carry no store identity: passing an identifier to a *different* store is a logic error that
+/// safely resolves against whatever segment holds that position there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SegmentId(usize);
+pub struct SegmentId(u64);
 
 impl SegmentId {
     /// Returns the numeric segment index.
     #[inline]
     #[must_use]
-    pub const fn index(self) -> usize {
+    pub const fn index(self) -> u64 {
         self.0
     }
 }
@@ -212,7 +214,7 @@ impl<B> Retained<B> {
 pub struct Store<B = Vec<u8>> {
     segments: VecDeque<Segment<B>>,
     /// Number of leading retired segments compacted away; offsets [`SegmentId`] indexing.
-    compacted: usize,
+    compacted: u64,
     /// End offset of the last parked segment; the lowest base the next park accepts.
     high_water: u64,
 }
@@ -229,29 +231,29 @@ impl<B> Store<B> {
         }
     }
 
-    /// Returns the number of segments ever parked, including retired ones.
+    /// Returns the number of segments ever parked, including retired and compacted ones.
+    ///
+    /// This counts history, not residency: it never decreases, and a store whose every segment
+    /// has been retired still reports the full count.
     #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.compacted.saturating_add(self.segments.len())
-    }
-
-    /// Returns `true` when no segments have ever been parked.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn segment_count(&self) -> u64 {
+        /* The resident count converts losslessly: it never exceeds the total parked count,
+        which the u64 address space bounds. */
+        self.compacted
+            .saturating_add(u64::try_from(self.segments.len()).unwrap_or(u64::MAX))
     }
 
     /// Returns the segment for `id` when it has not been compacted away.
     fn entry(&self, id: SegmentId) -> Option<&Segment<B>> {
-        self.segments.get(id.index().checked_sub(self.compacted)?)
+        let offset = id.index().checked_sub(self.compacted)?;
+        self.segments.get(usize::try_from(offset).ok()?)
     }
 
     /// Mutable counterpart of [`Self::entry`].
     fn entry_mut(&mut self, id: SegmentId) -> Option<&mut Segment<B>> {
-        self.segments
-            .get_mut(id.index().checked_sub(self.compacted)?)
+        let offset = id.index().checked_sub(self.compacted)?;
+        self.segments.get_mut(usize::try_from(offset).ok()?)
     }
 
     /// Returns whether `id` refers to a segment compacted away after retirement.
@@ -413,7 +415,7 @@ impl<B: AsRef<[u8]>> Store<B> {
             });
         };
 
-        let id = SegmentId(self.len());
+        let id = SegmentId(self.segment_count());
         self.high_water = span.end();
         self.segments.push_back(Segment::Retained(Retained {
             span,
@@ -562,7 +564,7 @@ impl<B: AsRef<[u8]>> Store<B> {
     /// regardless of seal state or waste thresholds. Returns the number of segments retired by
     /// this call.
     pub fn retire_all(&mut self) -> usize {
-        (self.compacted..self.len())
+        (self.compacted..self.segment_count())
             .filter(|&index| self.retire(SegmentId(index)))
             .count()
     }
@@ -593,6 +595,7 @@ impl<B: AsRef<[u8]>> Store<B> {
             let live = retained.backing.live_bytes.load(Ordering::Relaxed);
 
             if retained.len().saturating_sub(live) >= min_wasted_bytes {
+                let position = u64::try_from(position).unwrap_or(u64::MAX);
                 retirable.push(compacted.saturating_add(position));
             }
         }
