@@ -147,17 +147,22 @@ impl<B> Retained<B> {
             .retain(|lease| lease.upgrade().is_some_and(|slot| !slot.is_promoted()));
     }
 
-    /// Registers a loaned lease, pruning dead entries first when the registry is about to grow.
+    /// Creates a loaned lease over `range` and registers it, pruning dead registry entries
+    /// first when the registry is about to grow.
     ///
     /// Pruning at capacity keeps the registry proportional to the number of live loaned leases
     /// with amortized O(1) cost, even when the owner never calls
     /// [`maintain`](crate::Store::maintain).
-    fn register(&mut self, registration: Weak<Slot<B>>) {
+    fn lease(&mut self, range: SegmentRange) -> Lease<B> {
+        let (lease, registration) =
+            Lease::loaned(Arc::clone(&self.bytes), range, Arc::clone(&self.live_bytes));
+
         if self.leases.len() == self.leases.capacity() {
             self.prune();
         }
 
         self.leases.push(registration);
+        lease
     }
 }
 
@@ -432,20 +437,12 @@ impl<B: AsRef<[u8]>> Store<B> {
     /// dropped, promoted, or the segment is retired.
     #[must_use]
     pub fn lease(&mut self, span: Span) -> Option<Lease<B>> {
-        let (retained, range) = self.segments.iter_mut().find_map(|entry| {
+        self.segments.iter_mut().find_map(|entry| {
             let retained = entry.retained_mut()?;
             let range = span.segment_range(retained.span)?;
 
-            Some((retained, range))
-        })?;
-        let (lease, registration) = Lease::loaned(
-            Arc::clone(&retained.bytes),
-            range,
-            Arc::clone(&retained.live_bytes),
-        );
-        retained.register(registration);
-
-        Some(lease)
+            Some(retained.lease(range))
+        })
     }
 
     /// Maps `span` onto retained segments as `(position, range)` pairs covering the whole span in
@@ -511,13 +508,7 @@ impl<B: AsRef<[u8]>> Store<B> {
 
         for (position, range) in ranges {
             let retained = self.segments.get_mut(position)?.retained_mut()?;
-            let (lease, registration) = Lease::loaned(
-                Arc::clone(&retained.bytes),
-                range,
-                Arc::clone(&retained.live_bytes),
-            );
-            retained.register(registration);
-            collected.push(lease);
+            collected.push(retained.lease(range));
         }
 
         Some(collected)
