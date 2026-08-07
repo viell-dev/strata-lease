@@ -95,22 +95,18 @@ impl Span {
         self.end - self.start
     }
 
-    /// Maps this span into a segment parked at `base` holding `len` bytes.
+    /// Maps this span into `segment`-relative bounds when `segment` fully contains it.
     ///
-    /// Returns the segment-relative range when the segment fully contains the span, `None`
-    /// otherwise (including when `base + len` overflows the address space). This is the only
-    /// constructor of [`SegmentRange`], so every value that exists indexes a validated
-    /// containment.
-    pub(crate) fn segment_range(self, base: u64, len: usize) -> Option<SegmentRange> {
-        let segment_len = u64::try_from(len).ok()?;
-        let segment_end = base.checked_add(segment_len)?;
-
-        if self.start < base || self.end > segment_end {
+    /// Returns `None` when this span reaches outside `segment`, or — on platforms narrower than
+    /// 64 bits — when the offsets exceed `usize`. This is the only constructor of
+    /// [`SegmentRange`], so every value that exists indexes a validated containment.
+    pub(crate) fn segment_range(self, segment: Self) -> Option<SegmentRange> {
+        if self.start < segment.start || self.end > segment.end {
             return None;
         }
 
-        let start = usize::try_from(self.start.checked_sub(base)?).ok()?;
-        let end = usize::try_from(self.end.checked_sub(base)?).ok()?;
+        let start = usize::try_from(self.start.checked_sub(segment.start)?).ok()?;
+        let end = usize::try_from(self.end.checked_sub(segment.start)?).ok()?;
 
         Some(SegmentRange { start, end })
     }

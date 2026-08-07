@@ -132,7 +132,8 @@ impl<B> Segment<B> {
 }
 
 struct Retained<B> {
-    base: u64,
+    /// The absolute span the segment covers, validated at parking.
+    span: Span,
     bytes: Arc<B>,
     sealed: bool,
     leases: Vec<Weak<Slot<B>>>,
@@ -163,11 +164,6 @@ impl<B> Retained<B> {
 impl<B: AsRef<[u8]>> Retained<B> {
     fn len(&self) -> usize {
         (*self.bytes).as_ref().len()
-    }
-
-    /// Maps `span` to a range inside this segment when the segment fully contains it.
-    fn range_for(&self, span: Span) -> Option<SegmentRange> {
-        span.segment_range(self.base, self.len())
     }
 }
 
@@ -372,7 +368,12 @@ impl<B: AsRef<[u8]>> Store<B> {
             });
         }
 
-        let Some(end) = base.checked_add(len) else {
+        /* `len >= 1` forces `base < base + len`, so once the addition fits, the span bounds
+        are valid by construction; both failure paths funnel into the same rejection. */
+        let Some(span) = base
+            .checked_add(len)
+            .and_then(|end| Span::new(base, end).ok())
+        else {
             return Err(ParkError {
                 kind: ParkErrorKind::Unaddressable { base, len },
                 bytes,
@@ -380,14 +381,14 @@ impl<B: AsRef<[u8]>> Store<B> {
         };
 
         let id = SegmentId(self.len());
+        self.high_water = span.end();
         self.segments.push_back(Segment::Retained(Retained {
-            base,
+            span,
             bytes: Arc::new(bytes),
             sealed,
             leases: Vec::new(),
             live_bytes: Arc::new(AtomicUsize::new(0)),
         }));
-        self.high_water = end;
 
         Ok(id)
     }
@@ -402,15 +403,13 @@ impl<B: AsRef<[u8]>> Store<B> {
 
     /// Returns the absolute span a still-retained segment covers.
     ///
-    /// Returns `None` for unknown or retired segments; every retained segment has a span, because
-    /// parking validated its bounds.
+    /// Returns `None` for unknown or retired segments; every retained segment carries the span
+    /// validated at parking.
     #[must_use]
     pub fn segment_span(&self, segment: SegmentId) -> Option<Span> {
-        let retained = self.entry(segment)?.retained()?;
-        let len = u64::try_from(retained.len()).ok()?;
-        let end = retained.base.checked_add(len)?;
-
-        Span::new(retained.base, end).ok()
+        self.entry(segment)?
+            .retained()
+            .map(|retained| retained.span)
     }
 
     /// Returns bytes for `span` when one retained segment fully contains it.
@@ -422,7 +421,7 @@ impl<B: AsRef<[u8]>> Store<B> {
     pub fn bytes(&self, span: Span) -> Option<&[u8]> {
         self.segments.iter().find_map(|entry| {
             let retained = entry.retained()?;
-            let range = retained.range_for(span)?;
+            let range = span.segment_range(retained.span)?;
             (*retained.bytes).as_ref().get(range.bounds())
         })
     }
@@ -435,7 +434,7 @@ impl<B: AsRef<[u8]>> Store<B> {
     pub fn lease(&mut self, span: Span) -> Option<Lease<B>> {
         let (retained, range) = self.segments.iter_mut().find_map(|entry| {
             let retained = entry.retained_mut()?;
-            let range = retained.range_for(span)?;
+            let range = span.segment_range(retained.span)?;
 
             Some((retained, range))
         })?;
@@ -464,24 +463,20 @@ impl<B: AsRef<[u8]>> Store<B> {
             let Some(retained) = entry.retained() else {
                 continue;
             };
-            let len = u64::try_from(retained.len()).ok()?;
-            let end = retained.base.checked_add(len)?;
+            let segment = retained.span;
 
-            if cursor >= end || span.end() <= retained.base {
+            if cursor >= segment.end() || span.end() <= segment.start() {
                 continue;
             }
 
-            if cursor < retained.base {
+            if cursor < segment.start() {
                 return None;
             }
 
-            // Non-empty by the loop guard (`cursor < span.end()`) and `cursor < end`.
-            let stop = span.end().min(end);
+            // Non-empty by the loop guard (`cursor < span.end()`) and `cursor < segment.end()`.
+            let stop = span.end().min(segment.end());
             let piece = Span::new(cursor, stop).ok()?;
-            ranges.push((
-                position,
-                piece.segment_range(retained.base, retained.len())?,
-            ));
+            ranges.push((position, piece.segment_range(segment)?));
             cursor = stop;
         }
 
@@ -628,7 +623,7 @@ impl<B> Debug for Segment<B> {
         match self {
             Self::Retained(retained) => f
                 .debug_struct("Retained")
-                .field("base", &retained.base)
+                .field("span", &retained.span)
                 .field("sealed", &retained.sealed)
                 .field("registered_leases", &retained.leases.len())
                 .field("live_bytes", &retained.live_bytes.load(Ordering::Relaxed))

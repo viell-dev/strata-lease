@@ -32,9 +32,10 @@ Single-crate library with three private modules, all re-exported at the crate ro
   snapshot guard: it clones the `Arc<B>` and range out of the mutex instead of holding it, so
   reads never block promotion or retirement and guards nest freely.
 - **`store`**, `Store` / `SegmentId` / `ParkError` / `ParkErrorKind`: the owner side. Segments
-  live in a `VecDeque` behind a `compacted` offset as a `Segment` enum: `Retained` (with
-  `Arc<B>` bytes, a `Vec<Weak<Slot<B>>>` lease registry pruned amortized on insert and by
-  `maintain`, the shared live-byte counter, and a `sealed` flag) or a bare `Retired` tombstone,
+  live in a `VecDeque` behind a `compacted` offset as a `Segment` enum: `Retained` (with the
+  absolute `Span` validated at parking, `Arc<B>` bytes, a `Vec<Weak<Slot<B>>>` lease registry
+  pruned amortized on insert and by `maintain`, the shared live-byte counter, and a `sealed`
+  flag) or a bare `Retired` tombstone,
   so retired segments cannot carry stale bookkeeping. `park` validates against the store's
   `high_water` offset — buffers must be non-empty, in ascending non-overlapping base order, and
   `u64`-addressable — and rejects violations with a `ParkError` carrying the buffer back.

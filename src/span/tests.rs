@@ -58,20 +58,26 @@ fn errors_display_their_bounds() {
 
 #[test]
 fn segment_range_maps_contained_spans() {
-    let Some(range) = span(102, 104).segment_range(100, 5) else {
+    let Some(range) = span(102, 104).segment_range(span(100, 105)) else {
         panic!("contained span should map");
     };
 
     assert_eq!(range.bounds(), 2..4);
     assert_eq!(range.len(), 2);
+
+    // A segment maps onto itself completely.
+    let Some(full) = span(100, 105).segment_range(span(100, 105)) else {
+        panic!("identical span should map");
+    };
+    assert_eq!(full.bounds(), 0..5);
 }
 
 #[test]
 fn segment_range_rejects_uncontained_spans() {
     // Starts before the segment.
-    assert_eq!(span(99, 102).segment_range(100, 5), None);
+    assert_eq!(span(99, 102).segment_range(span(100, 105)), None);
     // Ends past the segment.
-    assert_eq!(span(103, 106).segment_range(100, 5), None);
-    // Segment end would overflow the address space.
-    assert_eq!(span(0, 1).segment_range(u64::MAX, 2), None);
+    assert_eq!(span(103, 106).segment_range(span(100, 105)), None);
+    // Disjoint entirely.
+    assert_eq!(span(0, 1).segment_range(span(100, 105)), None);
 }
