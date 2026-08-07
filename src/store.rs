@@ -496,11 +496,13 @@ impl<B: AsRef<[u8]>> Store<B> {
     /// Copies bytes for `span` into a vector, following spans across segment boundaries.
     ///
     /// This is the read-only counterpart of [`Self::leases`] for callers that want bytes without
-    /// creating a handle. Returns `None` when any part of the span is not retained.
+    /// creating a handle. Returns `None` when any part of the span is not retained, or — on
+    /// platforms narrower than 64 bits — when the copy could not fit in memory to begin with.
     #[must_use]
     pub fn copy_bytes(&self, span: Span) -> Option<Vec<u8>> {
+        let capacity = usize::try_from(span.len()).ok()?;
         let ranges = self.ranges(span)?;
-        let mut bytes = Vec::with_capacity(usize::try_from(span.len()).unwrap_or(0));
+        let mut bytes = Vec::with_capacity(capacity);
 
         for (position, range) in ranges {
             let retained = self.segments.get(position)?.retained()?;
