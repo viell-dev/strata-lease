@@ -145,23 +145,6 @@ impl<B> Lease<B> {
         (Self { slot }, registration)
     }
 
-    /// Creates a lease that starts owned with no bytes and pins nothing.
-    ///
-    /// Empty spans resolve to this: there is nothing to loan, so the lease never holds a pin on
-    /// any segment.
-    pub(crate) fn empty() -> Self {
-        let owned = OnceLock::new();
-        let _ = owned.set(Box::from(&[][..]));
-
-        Self {
-            slot: Arc::new(Slot {
-                owned,
-                source: Mutex::new(None),
-                live_bytes: Arc::new(AtomicUsize::new(0)),
-            }),
-        }
-    }
-
     /// Returns whether the lease holds its own copy of the bytes.
     ///
     /// This is a snapshot: under a concurrent promotion it can report `true` an instant before

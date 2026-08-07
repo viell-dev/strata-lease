@@ -2,7 +2,21 @@
 //! parser, DOM, or resolver would drive it, using only the public API.
 
 use std::thread;
-use strata_lease::{Lease, Span, Store};
+use strata_lease::{Lease, SegmentId, Span, Store};
+
+fn span(start: u64, end: u64) -> Span {
+    match Span::new(start, end) {
+        Ok(span) => span,
+        Err(error) => panic!("test span {start}..{end} should be valid: {error}"),
+    }
+}
+
+fn park<B: AsRef<[u8]>>(store: &mut Store<B>, base: u64, bytes: B) -> SegmentId {
+    match store.park(base, bytes) {
+        Ok(id) => id,
+        Err(error) => panic!("test park at {base} should succeed: {error}"),
+    }
+}
 
 /// A consumer that reads through the handle without knowing (or caring) which state it is in.
 fn checksum(lease: &Lease) -> usize {
@@ -14,9 +28,9 @@ fn parser_pipeline_keeps_values_and_reclaims_buffers() {
     // A `key=value;` document arriving in three chunks, parked as it is consumed. Keys are read
     // zero-copy and discarded; values become long-lived DOM leases.
     let chunks: [(&[u8], u64, Span, Span); 3] = [
-        (b"alpha=1;", 0, Span::new(0, 5), Span::new(6, 7)),
-        (b"beta=22;", 8, Span::new(8, 12), Span::new(13, 15)),
-        (b"gamma=333;", 16, Span::new(16, 21), Span::new(22, 25)),
+        (b"alpha=1;", 0, span(0, 5), span(6, 7)),
+        (b"beta=22;", 8, span(8, 12), span(13, 15)),
+        (b"gamma=333;", 16, span(16, 21), span(22, 25)),
     ];
 
     let mut store = Store::new();
@@ -24,7 +38,9 @@ fn parser_pipeline_keeps_values_and_reclaims_buffers() {
 
     for (chunk, base, key_span, value_span) in chunks {
         // Parked open ahead of leasing, so a maintenance sweep cannot race the parser here.
-        let id = store.park_open(base, chunk.to_vec());
+        let Ok(id) = store.park_open(base, chunk.to_vec()) else {
+            panic!("test park at {base} should succeed");
+        };
 
         let Some(key) = store.lease(key_span) else {
             panic!("key span should be retained");
@@ -60,12 +76,12 @@ fn parser_pipeline_keeps_values_and_reclaims_buffers() {
 #[test]
 fn loaned_reads_are_zero_copy_until_promotion() {
     let mut store = Store::new();
-    store.park(0, b"zero-copy".to_vec());
+    park(&mut store, 0, b"zero-copy".to_vec());
 
-    let Some(lease) = store.lease(Span::new(0, 4)) else {
+    let Some(lease) = store.lease(span(0, 4)) else {
         panic!("span should be retained");
     };
-    let Some(direct) = store.bytes(Span::new(0, 4)) else {
+    let Some(direct) = store.bytes(span(0, 4)) else {
         panic!("span should be retained");
     };
 
@@ -82,14 +98,9 @@ fn loaned_reads_are_zero_copy_until_promotion() {
 #[test]
 fn concurrent_consumers_survive_owner_reclamation() {
     let mut store = Store::new();
-    store.park(0, b"0123456789".repeat(4));
+    park(&mut store, 0, b"0123456789".repeat(4));
 
-    let spans = [
-        Span::new(0, 10),
-        Span::new(10, 20),
-        Span::new(20, 30),
-        Span::new(30, 40),
-    ];
+    let spans = [span(0, 10), span(10, 20), span(20, 30), span(30, 40)];
     let mut workers = Vec::new();
 
     for span in spans {
@@ -123,10 +134,10 @@ fn concurrent_consumers_survive_owner_reclamation() {
 #[test]
 fn fragmented_leases_read_across_parked_chunks() {
     let mut store = Store::new();
-    store.park(0, b"alpha".to_vec());
-    store.park(5, b"beta".to_vec());
+    park(&mut store, 0, b"alpha".to_vec());
+    park(&mut store, 5, b"beta".to_vec());
 
-    let Some(parts) = store.leases(Span::new(3, 7)) else {
+    let Some(parts) = store.leases(span(3, 7)) else {
         panic!("cross-chunk span should be retained");
     };
     let joined: Vec<u8> = parts.iter().flat_map(Lease::to_vec).collect();
@@ -144,8 +155,8 @@ fn owner_can_vanish_without_retiring() {
     // Without retirement the crate degrades to plain refcounting: the last loaned lease keeps
     // the parked buffer alive, so nothing dangles.
     let mut store = Store::new();
-    store.park(0, b"refcounted".to_vec());
-    let Some(lease) = store.lease(Span::new(0, 3)) else {
+    park(&mut store, 0, b"refcounted".to_vec());
+    let Some(lease) = store.lease(span(0, 3)) else {
         panic!("span should be retained");
     };
 
@@ -168,14 +179,15 @@ impl AsRef<[u8]> for Region {
 #[test]
 fn store_accepts_custom_buffer_types() {
     let mut store = Store::new();
-    store.park(
+    park(
+        &mut store,
         0,
         Region {
             bytes: Box::from(b"custom-buffer".as_slice()),
         },
     );
 
-    let Some(lease) = store.lease(Span::new(0, 6)) else {
+    let Some(lease) = store.lease(span(0, 6)) else {
         panic!("span should be retained");
     };
 

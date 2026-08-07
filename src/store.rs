@@ -3,7 +3,8 @@
 use crate::lease::{Lease, Slot};
 use crate::span::Span;
 use std::collections::VecDeque;
-use std::fmt::{self, Debug, Formatter};
+use std::error;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -26,15 +27,120 @@ impl SegmentId {
     }
 }
 
-struct Segment<B> {
+/// Why a buffer was rejected by [`Store::park`] or [`Store::park_open`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkErrorKind {
+    /// The buffer contains no bytes; an empty segment could never resolve any [`Span`].
+    Empty,
+    /// The base starts before the end of the previously parked segment, breaking the ascending,
+    /// non-overlapping segment order.
+    OutOfOrder {
+        /// The rejected base offset.
+        base: u64,
+        /// The lowest base the store accepts next: the end of the last parked segment.
+        min_base: u64,
+    },
+    /// `base + len` exceeds [`u64::MAX`], so the segment's tail bytes could never be addressed
+    /// by a [`Span`].
+    Unaddressable {
+        /// The rejected base offset.
+        base: u64,
+        /// The buffer length in bytes, saturated at [`u64::MAX`].
+        len: u64,
+    },
+}
+
+/// An error returned when a buffer cannot be parked.
+///
+/// The rejected buffer rides along and is handed back through [`ParkError::into_bytes`], so a
+/// failed park never costs the producer its data.
+pub struct ParkError<B> {
+    kind: ParkErrorKind,
+    bytes: B,
+}
+
+impl<B> ParkError<B> {
+    /// Returns why the buffer was rejected.
+    #[inline]
+    #[must_use]
+    pub const fn kind(&self) -> ParkErrorKind {
+        self.kind
+    }
+
+    /// Returns the rejected buffer.
+    #[inline]
+    #[must_use]
+    pub fn into_bytes(self) -> B {
+        self.bytes
+    }
+}
+
+impl<B> Debug for ParkError<B> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParkError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Display for ParkErrorKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Empty => write!(f, "an empty buffer cannot be parked"),
+            Self::OutOfOrder { base, min_base } => write!(
+                f,
+                "base {base} starts before the end {min_base} of the previously parked segment"
+            ),
+            Self::Unaddressable { base, len } => write!(
+                f,
+                "segment at base {base} with {len} bytes extends past the u64 address space"
+            ),
+        }
+    }
+}
+
+impl<B> Display for ParkError<B> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.kind, f)
+    }
+}
+
+impl<B> error::Error for ParkError<B> {}
+
+/// A parked segment: retained bytes plus lease bookkeeping, or a retired tombstone.
+///
+/// Retirement swaps the whole retained state for the tombstone at once, so a retired segment
+/// cannot carry a stale seal flag, lease registry, or live-byte counter.
+enum Segment<B> {
+    Retained(Retained<B>),
+    Retired,
+}
+
+impl<B> Segment<B> {
+    fn retained(&self) -> Option<&Retained<B>> {
+        match self {
+            Self::Retained(retained) => Some(retained),
+            Self::Retired => None,
+        }
+    }
+
+    fn retained_mut(&mut self) -> Option<&mut Retained<B>> {
+        match self {
+            Self::Retained(retained) => Some(retained),
+            Self::Retired => None,
+        }
+    }
+}
+
+struct Retained<B> {
     base: u64,
-    bytes: Option<Arc<B>>,
+    bytes: Arc<B>,
     sealed: bool,
     leases: Vec<Weak<Slot<B>>>,
     live_bytes: Arc<AtomicUsize>,
 }
 
-impl<B> Segment<B> {
+impl<B> Retained<B> {
     /// Drops registry entries whose lease is gone or already promoted.
     fn prune(&mut self) {
         self.leases
@@ -55,28 +161,22 @@ impl<B> Segment<B> {
     }
 }
 
-impl<B: AsRef<[u8]>> Segment<B> {
+impl<B: AsRef<[u8]>> Retained<B> {
     fn len(&self) -> usize {
-        self.bytes
-            .as_ref()
-            .map_or(0, |bytes| (**bytes).as_ref().len())
+        (*self.bytes).as_ref().len()
     }
 
     /// Maps `span` to a range inside this segment when the segment fully contains it.
     fn range_for(&self, span: Span) -> Option<Range<usize>> {
-        if span.end < span.start || self.bytes.is_none() {
-            return None;
-        }
-
         let len = u64::try_from(self.len()).ok()?;
         let end = self.base.checked_add(len)?;
 
-        if span.start < self.base || span.end > end {
+        if span.start() < self.base || span.end() > end {
             return None;
         }
 
-        let start = usize::try_from(span.start.checked_sub(self.base)?).ok()?;
-        let stop = usize::try_from(span.end.checked_sub(self.base)?).ok()?;
+        let start = usize::try_from(span.start().checked_sub(self.base)?).ok()?;
+        let stop = usize::try_from(span.end().checked_sub(self.base)?).ok()?;
 
         Some(start..stop)
     }
@@ -92,11 +192,11 @@ impl<B: AsRef<[u8]>> Segment<B> {
 ///
 /// # Segment ordering
 ///
-/// Segments are matched in park order. Bases are expected to be ascending and non-overlapping, as
-/// produced by parking consecutive buffers of one input stream; [`Store::park`] does not validate
-/// this. With out-of-order bases, single-segment lookups still resolve, but spans crossing
-/// segment boundaries conservatively resolve to `None`. With overlapping bases, the first-parked
-/// segment containing a span wins.
+/// Parking validates what lookups rely on: segments are non-empty, in ascending non-overlapping
+/// base order, and fully addressable within `u64`. A buffer that would break this is rejected
+/// with a [`ParkError`] that hands the buffer back, so the store never holds a segment those
+/// invariants do not cover. Gaps between segments are fine; spans reaching into a gap resolve to
+/// `None`.
 ///
 /// # Memory
 ///
@@ -109,6 +209,8 @@ pub struct Store<B = Vec<u8>> {
     segments: VecDeque<Segment<B>>,
     /// Number of leading retired segments compacted away; offsets [`SegmentId`] indexing.
     compacted: usize,
+    /// End offset of the last parked segment; the lowest base the next park accepts.
+    high_water: u64,
 }
 
 impl<B> Store<B> {
@@ -119,6 +221,7 @@ impl<B> Store<B> {
         Self {
             segments: VecDeque::new(),
             compacted: 0,
+            high_water: 0,
         }
     }
 
@@ -157,11 +260,7 @@ impl<B> Store<B> {
     /// Only ever removes retired segments, whose observable state is settled, so compaction is
     /// invisible through the public API apart from the memory it returns.
     fn compact(&mut self) {
-        while self
-            .segments
-            .front()
-            .is_some_and(|entry| entry.bytes.is_none())
-        {
+        while matches!(self.segments.front(), Some(Segment::Retired)) {
             self.segments.pop_front();
             self.compacted = self.compacted.saturating_add(1);
         }
@@ -179,8 +278,11 @@ impl<B> Store<B> {
             return Some(0);
         }
 
-        self.entry(segment)
-            .map(|entry| entry.live_bytes.load(Ordering::Relaxed))
+        self.entry(segment).map(|entry| {
+            entry
+                .retained()
+                .map_or(0, |retained| retained.live_bytes.load(Ordering::Relaxed))
+        })
     }
 
     /// Returns whether `segment` has been retired.
@@ -190,7 +292,7 @@ impl<B> Store<B> {
             return Some(true);
         }
 
-        self.entry(segment).map(|entry| entry.bytes.is_none())
+        self.entry(segment).map(|entry| entry.retained().is_none())
     }
 
     /// Returns whether `segment` is sealed, and therefore eligible for [`Self::maintain`].
@@ -203,7 +305,7 @@ impl<B> Store<B> {
         }
 
         self.entry(segment)
-            .map(|entry| entry.sealed || entry.bytes.is_none())
+            .map(|entry| entry.retained().is_none_or(|retained| retained.sealed))
     }
 
     /// Marks an open segment as retirable by [`Self::maintain`].
@@ -219,20 +321,25 @@ impl<B> Store<B> {
             return false;
         };
 
-        entry.sealed = true;
+        if let Some(retained) = entry.retained_mut() {
+            retained.sealed = true;
+        }
+
         true
     }
+}
 
+impl<B: AsRef<[u8]>> Store<B> {
     /// Parks a segment with its absolute base offset.
     ///
     /// The segment is sealed: [`Self::maintain`] may retire it as soon as its waste threshold is
     /// met. Use [`Self::park_open`] to defer that.
     ///
-    /// Bases are expected to be ascending and non-overlapping across parks; see the
-    /// [type-level notes](Store#segment-ordering). `base + bytes.len()` must not exceed
-    /// [`u64::MAX`]; a segment parked past that limit is retained but unaddressable, and every
-    /// span lookup into it resolves to `None`.
-    pub fn park(&mut self, base: u64, bytes: B) -> SegmentId {
+    /// Parking validates the segment invariants up front instead of storing a segment lookups
+    /// cannot honor: the buffer must be non-empty, `base` must not precede the end of the
+    /// previously parked segment, and `base + len` must not exceed [`u64::MAX`]. A rejected
+    /// buffer is handed back inside the [`ParkError`].
+    pub fn park(&mut self, base: u64, bytes: B) -> Result<SegmentId, ParkError<B>> {
         self.insert(base, bytes, true)
     }
 
@@ -240,86 +347,115 @@ impl<B> Store<B> {
     ///
     /// Use this when parking ahead of attaching leases, so a maintenance sweep between the two
     /// steps cannot retire the still-unleased segment. Explicit [`Self::retire`] and
-    /// [`Self::retire_all`] calls ignore the seal state. The base expectations of [`Self::park`]
-    /// apply.
-    pub fn park_open(&mut self, base: u64, bytes: B) -> SegmentId {
+    /// [`Self::retire_all`] calls ignore the seal state. The validation of [`Self::park`]
+    /// applies.
+    pub fn park_open(&mut self, base: u64, bytes: B) -> Result<SegmentId, ParkError<B>> {
         self.insert(base, bytes, false)
     }
 
-    fn insert(&mut self, base: u64, bytes: B, sealed: bool) -> SegmentId {
+    fn insert(&mut self, base: u64, bytes: B, sealed: bool) -> Result<SegmentId, ParkError<B>> {
+        let Ok(len) = u64::try_from(bytes.as_ref().len()) else {
+            // Unreachable outside hypothetical >64-bit platforms; such a length cannot fit the
+            // u64 address space either way.
+            return Err(ParkError {
+                kind: ParkErrorKind::Unaddressable {
+                    base,
+                    len: u64::MAX,
+                },
+                bytes,
+            });
+        };
+
+        if len == 0 {
+            return Err(ParkError {
+                kind: ParkErrorKind::Empty,
+                bytes,
+            });
+        }
+
+        if base < self.high_water {
+            return Err(ParkError {
+                kind: ParkErrorKind::OutOfOrder {
+                    base,
+                    min_base: self.high_water,
+                },
+                bytes,
+            });
+        }
+
+        let Some(end) = base.checked_add(len) else {
+            return Err(ParkError {
+                kind: ParkErrorKind::Unaddressable { base, len },
+                bytes,
+            });
+        };
+
         let id = SegmentId(self.len());
-        self.segments.push_back(Segment {
+        self.segments.push_back(Segment::Retained(Retained {
             base,
-            bytes: Some(Arc::new(bytes)),
+            bytes: Arc::new(bytes),
             sealed,
             leases: Vec::new(),
             live_bytes: Arc::new(AtomicUsize::new(0)),
-        });
+        }));
+        self.high_water = end;
 
-        id
+        Ok(id)
     }
-}
 
-impl<B: AsRef<[u8]>> Store<B> {
     /// Returns the total retained bytes across parked segments, saturating at `usize::MAX`.
     #[must_use]
     pub fn retained_len(&self) -> usize {
-        self.segments
-            .iter()
-            .fold(0usize, |total, entry| total.saturating_add(entry.len()))
+        self.segments.iter().fold(0usize, |total, entry| {
+            total.saturating_add(entry.retained().map_or(0, Retained::len))
+        })
     }
 
     /// Returns the absolute span a still-retained segment covers.
     ///
-    /// Returns `None` for unknown, retired, or unaddressable (base-plus-length overflow)
-    /// segments.
+    /// Returns `None` for unknown or retired segments; every retained segment has a span, because
+    /// parking validated its bounds.
     #[must_use]
     pub fn segment_span(&self, segment: SegmentId) -> Option<Span> {
-        let entry = self.entry(segment)?;
-        entry.bytes.as_ref()?;
-        let len = u64::try_from(entry.len()).ok()?;
-        let end = entry.base.checked_add(len)?;
+        let retained = self.entry(segment)?.retained()?;
+        let len = u64::try_from(retained.len()).ok()?;
+        let end = retained.base.checked_add(len)?;
 
-        Some(Span::new(entry.base, end))
+        Span::new(retained.base, end).ok()
     }
 
     /// Returns bytes for `span` when one retained segment fully contains it.
     ///
     /// This is the zero-copy peek for owners and trusted callers; the borrow pins the store
     /// itself, not the segment. Spans crossing segment boundaries resolve to `None` — lease them
-    /// through [`Self::leases`] or copy them through [`Self::copy_bytes`] instead. Empty spans
-    /// (including reversed ones) resolve to empty bytes everywhere.
+    /// through [`Self::leases`] or copy them through [`Self::copy_bytes`] instead.
     #[must_use]
     pub fn bytes(&self, span: Span) -> Option<&[u8]> {
-        if span.is_empty() {
-            return Some(&[]);
-        }
-
         self.segments.iter().find_map(|entry| {
-            let range = entry.range_for(span)?;
-            (**entry.bytes.as_ref()?).as_ref().get(range)
+            let retained = entry.retained()?;
+            let range = retained.range_for(span)?;
+            (*retained.bytes).as_ref().get(range)
         })
     }
 
     /// Creates a lease for `span` when one retained segment fully contains it.
     ///
     /// The lease starts loaned: it reads from the retained segment and pins it until the lease is
-    /// dropped, promoted, or the segment is retired. Empty spans (including reversed ones) yield
-    /// an owned empty lease everywhere; it pins nothing.
+    /// dropped, promoted, or the segment is retired.
     #[must_use]
     pub fn lease(&mut self, span: Span) -> Option<Lease<B>> {
-        if span.is_empty() {
-            return Some(Lease::empty());
-        }
+        let (retained, range) = self.segments.iter_mut().find_map(|entry| {
+            let retained = entry.retained_mut()?;
+            let range = retained.range_for(span)?;
 
-        let entry = self
-            .segments
-            .iter_mut()
-            .find(|entry| entry.range_for(span).is_some())?;
-        let range = entry.range_for(span)?;
-        let bytes = Arc::clone(entry.bytes.as_ref()?);
-        let (lease, registration) = Lease::loaned(bytes, range, Arc::clone(&entry.live_bytes));
-        entry.register(registration);
+            Some((retained, range))
+        })?;
+        let (lease, registration) = Lease::loaned(
+            Arc::clone(&retained.bytes),
+            range,
+            Arc::clone(&retained.live_bytes),
+        );
+        retained.register(registration);
 
         Some(lease)
     }
@@ -328,55 +464,50 @@ impl<B: AsRef<[u8]>> Store<B> {
     /// park order. Positions index `self.segments` directly and are only valid until the next
     /// mutation.
     fn ranges(&self, span: Span) -> Option<Vec<(usize, Range<usize>)>> {
-        if span.is_empty() {
-            return Some(Vec::new());
-        }
-
-        let mut cursor = span.start;
+        let mut cursor = span.start();
         let mut ranges = Vec::new();
 
         for (position, entry) in self.segments.iter().enumerate() {
-            if cursor >= span.end {
+            if cursor >= span.end() {
                 break;
             }
 
-            let Some(bytes) = entry.bytes.as_ref() else {
+            let Some(retained) = entry.retained() else {
                 continue;
             };
-            let len = u64::try_from((**bytes).as_ref().len()).ok()?;
-            let end = entry.base.checked_add(len)?;
+            let len = u64::try_from(retained.len()).ok()?;
+            let end = retained.base.checked_add(len)?;
 
-            if cursor >= end || span.end <= entry.base {
+            if cursor >= end || span.end() <= retained.base {
                 continue;
             }
 
-            if cursor < entry.base {
+            if cursor < retained.base {
                 return None;
             }
 
-            let stop = span.end.min(end);
-            let start = usize::try_from(cursor.checked_sub(entry.base)?).ok()?;
-            let stop_offset = usize::try_from(stop.checked_sub(entry.base)?).ok()?;
+            let stop = span.end().min(end);
+            let start = usize::try_from(cursor.checked_sub(retained.base)?).ok()?;
+            let stop_offset = usize::try_from(stop.checked_sub(retained.base)?).ok()?;
             ranges.push((position, start..stop_offset));
             cursor = stop;
         }
 
-        (cursor == span.end).then_some(ranges)
+        (cursor == span.end()).then_some(ranges)
     }
 
     /// Copies bytes for `span` into a vector, following spans across segment boundaries.
     ///
     /// This is the read-only counterpart of [`Self::leases`] for callers that want bytes without
-    /// creating a handle. Returns `None` when any part of the span is not retained; empty spans
-    /// (including reversed ones) yield an empty vector everywhere.
+    /// creating a handle. Returns `None` when any part of the span is not retained.
     #[must_use]
     pub fn copy_bytes(&self, span: Span) -> Option<Vec<u8>> {
         let ranges = self.ranges(span)?;
         let mut bytes = Vec::with_capacity(usize::try_from(span.len()).unwrap_or(0));
 
         for (position, range) in ranges {
-            let entry = self.segments.get(position)?;
-            bytes.extend_from_slice((**entry.bytes.as_ref()?).as_ref().get(range)?);
+            let retained = self.segments.get(position)?.retained()?;
+            bytes.extend_from_slice((*retained.bytes).as_ref().get(range)?);
         }
 
         Some(bytes)
@@ -385,17 +516,20 @@ impl<B: AsRef<[u8]>> Store<B> {
     /// Creates leases covering `span` across consecutive retained segments.
     ///
     /// Spans that fit one segment yield a single lease. Returns `None` when any part of the span
-    /// is not retained; empty spans (including reversed ones) yield an empty vector everywhere.
+    /// is not retained; a successful result always contains at least one lease.
     #[must_use]
     pub fn leases(&mut self, span: Span) -> Option<Vec<Lease<B>>> {
         let ranges = self.ranges(span)?;
         let mut collected = Vec::with_capacity(ranges.len());
 
         for (position, range) in ranges {
-            let entry = self.segments.get_mut(position)?;
-            let bytes = Arc::clone(entry.bytes.as_ref()?);
-            let (lease, registration) = Lease::loaned(bytes, range, Arc::clone(&entry.live_bytes));
-            entry.register(registration);
+            let retained = self.segments.get_mut(position)?.retained_mut()?;
+            let (lease, registration) = Lease::loaned(
+                Arc::clone(&retained.bytes),
+                range,
+                Arc::clone(&retained.live_bytes),
+            );
+            retained.register(registration);
             collected.push(lease);
         }
 
@@ -418,18 +552,17 @@ impl<B: AsRef<[u8]>> Store<B> {
             return false;
         };
 
-        if entry.bytes.is_none() {
+        let Some(retained) = entry.retained() else {
             return false;
-        }
+        };
 
-        for registration in &entry.leases {
+        for registration in &retained.leases {
             if let Some(slot) = registration.upgrade() {
                 slot.promote();
             }
         }
 
-        entry.leases = Vec::new();
-        entry.bytes = None;
+        *entry = Segment::Retired;
         self.compact();
         true
     }
@@ -455,18 +588,23 @@ impl<B: AsRef<[u8]>> Store<B> {
     /// number of segments retired.
     pub fn maintain(&mut self, min_wasted_bytes: usize) -> usize {
         let mut retirable = Vec::new();
+        let compacted = self.compacted;
 
         for (position, entry) in self.segments.iter_mut().enumerate() {
-            entry.prune();
+            let Some(retained) = entry.retained_mut() else {
+                continue;
+            };
 
-            if !entry.sealed || entry.bytes.is_none() {
+            retained.prune();
+
+            if !retained.sealed {
                 continue;
             }
 
-            let live = entry.live_bytes.load(Ordering::Relaxed);
+            let live = retained.live_bytes.load(Ordering::Relaxed);
 
-            if entry.len().saturating_sub(live) >= min_wasted_bytes {
-                retirable.push(self.compacted.saturating_add(position));
+            if retained.len().saturating_sub(live) >= min_wasted_bytes {
+                retirable.push(compacted.saturating_add(position));
             }
         }
 
@@ -488,19 +626,23 @@ impl<B> Debug for Store<B> {
         f.debug_struct("Store")
             .field("segments", &self.segments)
             .field("compacted", &self.compacted)
+            .field("high_water", &self.high_water)
             .finish()
     }
 }
 
 impl<B> Debug for Segment<B> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Segment")
-            .field("base", &self.base)
-            .field("retired", &self.bytes.is_none())
-            .field("sealed", &self.sealed)
-            .field("registered_leases", &self.leases.len())
-            .field("live_bytes", &self.live_bytes.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
+        match self {
+            Self::Retained(retained) => f
+                .debug_struct("Retained")
+                .field("base", &retained.base)
+                .field("sealed", &retained.sealed)
+                .field("registered_leases", &retained.leases.len())
+                .field("live_bytes", &retained.live_bytes.load(Ordering::Relaxed))
+                .finish_non_exhaustive(),
+            Self::Retired => f.write_str("Retired"),
+        }
     }
 }
 

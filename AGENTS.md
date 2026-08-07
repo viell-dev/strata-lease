@@ -17,9 +17,10 @@ The crate uses strict lints configured in `Cargo.toml`. Key points:
 
 Single-crate library with three private modules, all re-exported at the crate root:
 
-- **`span`**, `Span`: absolute byte spans in the logical input stream, mapped onto retained
-  segments through each segment's base offset. Zero-length spans (including reversed ones)
-  resolve successfully everywhere and yield empty bytes.
+- **`span`**, `Span` and `Error` (re-exported as `SpanError`): non-empty absolute byte spans in
+  the logical input stream, mapped onto retained segments through each segment's base offset.
+  `Span::new` enforces `start < end`, so empty and reversed spans are unrepresentable; the store
+  never has to special-case them.
 - **`lease`**, `Lease` / `LeaseBytes` and the crate-internal `Slot`: the consumer-side promotable
   handle. A `Slot` holds `owned: OnceLock<Box<[u8]>>`, `source: Mutex<Option<(Arc<B>, Range)>>`,
   and a shared `Arc<AtomicUsize>` live-byte counter (saturating, advisory). The pin on a segment
@@ -27,18 +28,23 @@ Single-crate library with three private modules, all re-exported at the crate ro
   decrements the counter exactly once. Promotion copies under the lock *before* taking the
   source, so a panicking buffer `as_ref` leaves the lease loaned and retryable. `LeaseBytes` is a
   snapshot guard: it clones the `Arc<B>` and range out of the mutex instead of holding it, so
-  reads never block promotion or retirement and guards nest freely. Empty-span leases start owned
-  and pin nothing.
-- **`store`**, `Store` / `SegmentId`: the owner side. Segments live in a `VecDeque` behind a
-  `compacted` offset; each keeps `Option<Arc<B>>` bytes, a `Vec<Weak<Slot<B>>>` lease registry
-  (pruned amortized on insert and by `maintain`), the shared live-byte counter, and a `sealed`
-  flag. `retire` promotes surviving leases *before* releasing the registry and bytes (panic-safe,
-  retryable), then compacts leading retired tombstones; `maintain` retires sealed segments by the
+  reads never block promotion or retirement and guards nest freely.
+- **`store`**, `Store` / `SegmentId` / `ParkError` / `ParkErrorKind`: the owner side. Segments
+  live in a `VecDeque` behind a `compacted` offset as a `Segment` enum: `Retained` (with
+  `Arc<B>` bytes, a `Vec<Weak<Slot<B>>>` lease registry pruned amortized on insert and by
+  `maintain`, the shared live-byte counter, and a `sealed` flag) or a bare `Retired` tombstone,
+  so retired segments cannot carry stale bookkeeping. `park` validates against the store's
+  `high_water` offset — buffers must be non-empty, in ascending non-overlapping base order, and
+  `u64`-addressable — and rejects violations with a `ParkError` carrying the buffer back.
+  `retire` promotes surviving leases *before* swapping in the tombstone (panic-safe, retryable),
+  then compacts leading retired tombstones; `maintain` retires sealed segments by the
   wasted-bytes threshold using the O(1) counters. `SegmentId`s are stable: compacted identifiers
   keep answering with their settled state (retired, zero live bytes).
 
 Key invariants: promotion is idempotent and race-safe because all owned-copy writes happen under
 the source mutex; leases outlive the store safely because loaned slots share ownership of the
 segment bytes; compaction only ever removes retired segments, so it is invisible through the
-public API. Tests live in sibling `tests.rs` files per module, plus consumer-facing coverage in
-`tests/consumer.rs` and adversarial/model coverage in `tests/hardening.rs`.
+public API; spans and parked segments are validated at construction, so lookups never see an
+empty span, a reversed span, or a segment out of order. Tests live in sibling `tests.rs` files
+per module, plus consumer-facing coverage in `tests/consumer.rs` and adversarial/model coverage
+in `tests/hardening.rs`.

@@ -10,19 +10,28 @@ fn budget(miri: usize, native: usize) -> usize {
     if cfg!(miri) { miri } else { native }
 }
 
+fn span(start: u64, end: u64) -> Span {
+    match Span::new(start, end) {
+        Ok(span) => span,
+        Err(error) => panic!("test span {start}..{end} should be valid: {error}"),
+    }
+}
+
+fn park(store: &mut Store, base: u64, bytes: Vec<u8>) -> SegmentId {
+    match store.park(base, bytes) {
+        Ok(id) => id,
+        Err(error) => panic!("test park at {base} should succeed: {error}"),
+    }
+}
+
 #[test]
 fn retirement_races_readers_promoters_and_cloners() {
-    let spans = [
-        Span::new(0, 20),
-        Span::new(20, 40),
-        Span::new(40, 60),
-        Span::new(60, 80),
-    ];
+    let spans = [span(0, 20), span(20, 40), span(40, 60), span(60, 80)];
     let expected = b"0123456789".repeat(2);
 
     for _ in 0..budget(4, 64) {
         let mut store = Store::new();
-        store.park(0, b"0123456789".repeat(8));
+        park(&mut store, 0, b"0123456789".repeat(8));
         let barrier = Arc::new(Barrier::new(spans.len().saturating_add(1)));
         let mut workers = Vec::new();
 
@@ -117,7 +126,11 @@ fn randomized_lifecycle_matches_reference_model() {
             let Some(bytes) = stream.get(offset..end) else {
                 panic!("chunk range should be inside the stream");
             };
-            let id = store.park(u64::try_from(offset).unwrap_or(u64::MAX), bytes.to_vec());
+            let id = park(
+                &mut store,
+                u64::try_from(offset).unwrap_or(u64::MAX),
+                bytes.to_vec(),
+            );
             chunks.push(Chunk {
                 id,
                 start: offset,
@@ -141,7 +154,7 @@ fn randomized_lifecycle_matches_reference_model() {
                     let b = a
                         .saturating_add(rng.below(24).saturating_add(1))
                         .min(chunk.end);
-                    let span = Span::new(
+                    let span = span(
                         u64::try_from(a).unwrap_or(u64::MAX),
                         u64::try_from(b).unwrap_or(u64::MAX),
                     );
@@ -211,7 +224,7 @@ fn verify(store: &Store, chunks: &[Chunk], held: &[(Lease, Vec<u8>)], stream: &[
     }
 
     for chunk in chunks {
-        let span = Span::new(
+        let span = span(
             u64::try_from(chunk.start).unwrap_or(u64::MAX),
             u64::try_from(chunk.end).unwrap_or(u64::MAX),
         );
@@ -225,10 +238,8 @@ fn verify(store: &Store, chunks: &[Chunk], held: &[(Lease, Vec<u8>)], stream: &[
                 assert_eq!(store.copy_bytes(span), Some(expected.to_vec()));
             }
             Some(true) => {
-                if !span.is_empty() {
-                    assert_eq!(store.bytes(span), None);
-                    assert_eq!(store.copy_bytes(span), None);
-                }
+                assert_eq!(store.bytes(span), None);
+                assert_eq!(store.copy_bytes(span), None);
             }
             None => panic!("chunk identifiers should stay valid"),
         }

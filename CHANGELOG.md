@@ -17,7 +17,9 @@ audit.
   (`park`, `park_open`, `seal`), resolves absolute `Span`s to zero-copy bytes
   (`bytes`) or handle-free copies across segment boundaries (`copy_bytes`), and
   hands out promotable leases (`lease`, plus `leases` for spans crossing
-  segment boundaries).
+  segment boundaries). Parking validates its invariants up front — a non-empty
+  buffer, ascending non-overlapping bases, `u64`-addressable bounds — and
+  rejects anything else with a `ParkError` that hands the buffer back.
 - `Lease<B>`, the consumer side: a cheap, cloneable, thread-safe handle that is
   either loaned (reads from the retained segment it pins) or owned (holds its
   own copy). `bytes()` reads uniformly in both states through the `LeaseBytes`
@@ -29,8 +31,11 @@ audit.
   `maintain(min_wasted_bytes)` retires sealed segments once their wasted
   (retained minus live loaned) bytes reach the threshold, using O(1) shared
   live-byte counters instead of walking the registry.
-- `Span` for absolute byte addressing (with `Range<u64>` conversions and
-  ordering) and `SegmentId` for parked segments.
+- Non-empty `Span` for absolute byte addressing: `Span::new` and
+  `TryFrom<Range<u64>>` reject empty and reversed bounds with a `SpanError`,
+  so every constructed span covers at least one byte; conversions to
+  `Range<u64>` and lexicographic ordering included. `SegmentId` identifies
+  parked segments.
 - Owner-side inspection: `is_sealed(id)` reports maintenance eligibility and
   `segment_span(id)` the absolute span a retained segment covers.
 - Project metadata following the `strata-reader` conventions: strict lint
@@ -43,9 +48,11 @@ audit.
   allocation instead of holding the lease's internal lock, so guards nest
   freely, never deadlock, stay valid across promotion and retirement, and
   retirement never blocks on active readers.
-- Empty spans (including reversed ones) resolve successfully against any store
-  through every accessor and yield empty bytes; an empty lease starts owned and
-  pins nothing.
+- Invalid states are rejected at construction instead of resolved leniently at
+  lookup: empty and reversed spans are unrepresentable, misparked segments
+  (empty, out of base order, or overflowing the `u64` address space) never
+  enter the store, and a retired segment drops its seal flag, lease registry,
+  and live-byte counter together with its bytes.
 - Retired segments compact away once every segment parked before them is
   retired too, so a streaming park-and-retire loop runs in bounded memory;
   `SegmentId`s stay valid and report the settled retired state.

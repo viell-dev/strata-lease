@@ -1,10 +1,19 @@
 use crate::{Lease, Span, Store};
 use std::thread;
 
-fn leased(text: &str, span: Span) -> (Store, Lease) {
+fn span(start: u64, end: u64) -> Span {
+    match Span::new(start, end) {
+        Ok(span) => span,
+        Err(error) => panic!("test span {start}..{end} should be valid: {error}"),
+    }
+}
+
+fn leased(text: &str, start: u64, end: u64) -> (Store, Lease) {
     let mut store = Store::new();
-    store.park(0, text.as_bytes().to_vec());
-    let Some(lease) = store.lease(span) else {
+    if let Err(error) = store.park(0, text.as_bytes().to_vec()) {
+        panic!("test park should succeed: {error}");
+    }
+    let Some(lease) = store.lease(span(start, end)) else {
         panic!("span should be retained");
     };
 
@@ -13,7 +22,7 @@ fn leased(text: &str, span: Span) -> (Store, Lease) {
 
 #[test]
 fn lease_reads_uniformly_before_and_after_promotion() {
-    let (_store, lease) = leased("key=value\n", Span::new(4, 9));
+    let (_store, lease) = leased("key=value\n", 4, 9);
 
     assert!(lease.is_loaned());
     assert!(!lease.is_owned());
@@ -32,18 +41,8 @@ fn lease_reads_uniformly_before_and_after_promotion() {
 }
 
 #[test]
-fn empty_span_lease_is_owned_and_pins_nothing() {
-    let (_store, lease) = leased("abc", Span::new(1, 1));
-
-    assert!(lease.is_owned());
-    assert_eq!(lease.len(), 0);
-    assert!(lease.is_empty());
-    assert_eq!(&*lease.bytes(), b"");
-}
-
-#[test]
 fn nested_guards_on_one_lease_do_not_deadlock() {
-    let (_store, lease) = leased("nested", Span::new(0, 6));
+    let (_store, lease) = leased("nested", 0, 6);
 
     let first = lease.bytes();
     let second = lease.bytes();
@@ -57,7 +56,7 @@ fn nested_guards_on_one_lease_do_not_deadlock() {
 
 #[test]
 fn promotion_does_not_block_or_invalidate_active_guards() {
-    let (_store, lease) = leased("guarded", Span::new(0, 7));
+    let (_store, lease) = leased("guarded", 0, 7);
     let guard = lease.bytes();
 
     lease.promote();
@@ -72,7 +71,7 @@ fn promotion_does_not_block_or_invalidate_active_guards() {
 
 #[test]
 fn promotion_reaches_every_clone() {
-    let (_store, lease) = leased("cloned", Span::new(0, 6));
+    let (_store, lease) = leased("cloned", 0, 6);
     let clone = lease.clone();
 
     lease.promote();
@@ -83,11 +82,7 @@ fn promotion_reaches_every_clone() {
 
 #[test]
 fn leases_move_across_threads() {
-    let mut store = Store::new();
-    store.park(0, b"shared-bytes".to_vec());
-    let Some(lease) = store.lease(Span::new(0, 6)) else {
-        panic!("span should be retained");
-    };
+    let (mut store, lease) = leased("shared-bytes", 0, 6);
 
     let reader = thread::spawn(move || lease.to_vec());
     store.retire_all();
@@ -108,7 +103,7 @@ fn leases_are_send_and_sync() {
 
 #[test]
 fn lease_debug_reports_promotion_state() {
-    let (_store, lease) = leased("debug", Span::new(0, 5));
+    let (_store, lease) = leased("debug", 0, 5);
 
     assert!(format!("{lease:?}").contains("owned: false"));
     lease.promote();

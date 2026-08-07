@@ -10,8 +10,13 @@
 //!
 //! # How it works
 //!
-//! - A [`Store`] retains parked byte segments, each with an absolute base offset.
-//! - [`Store::lease`] maps an absolute [`Span`] to a [`Lease`]: a cheap, cloneable, thread-safe
+//! - A [`Store`] retains parked byte segments, each with an absolute base offset. Parking
+//!   validates the segment invariants up front — non-empty, ascending non-overlapping bases,
+//!   addressable within `u64` — and rejects anything else with a [`ParkError`] that hands the
+//!   buffer back.
+//! - [`Store::lease`] maps an absolute [`Span`] — non-empty by construction; [`Span::new`]
+//!   rejects empty and reversed bounds with a [`SpanError`] — to a [`Lease`]: a cheap, cloneable,
+//!   thread-safe
 //!   handle that is either *loaned* (reads from the retained segment it pins) or *owned* (holds
 //!   its own copy). Consumers read through [`Lease::bytes`] and never need to care which state the
 //!   lease is in.
@@ -32,10 +37,10 @@
 //!
 //! // The owner parks a buffer it has finished producing.
 //! let mut store = Store::new();
-//! store.park(0, b"key=value\n".to_vec());
+//! store.park(0, b"key=value\n".to_vec()).unwrap();
 //!
 //! // Consumers hold cheap leases instead of copies.
-//! let value = store.lease(Span::new(4, 9)).unwrap();
+//! let value = store.lease(Span::new(4, 9).unwrap()).unwrap();
 //! assert!(value.is_loaned());
 //! assert_eq!(&*value.bytes(), b"value");
 //!
@@ -49,19 +54,16 @@
 //!
 //! # Contracts
 //!
-//! Everything in this crate is safe code; violating a contract below degrades behavior (empty or
-//! truncated reads, delayed reclamation) but can never cause memory unsafety.
+//! Invalid inputs that can be rejected up front are: [`Span::new`] refuses empty and reversed
+//! bounds, and [`Store::park`] refuses segments that would break the store's ordering and
+//! addressability invariants. What remains below are runtime contracts; everything in this crate
+//! is safe code, and violating one degrades behavior (empty or truncated reads, delayed
+//! reclamation) but can never cause memory unsafety.
 //!
 //! - **Stable buffers.** `Store<B>` accepts any `B: AsRef<[u8]>` and trusts that `as_ref` returns
 //!   the same slice — same address, same length, same contents — on every call. An impl that
 //!   mutates or swaps its slice between calls safely degrades: reads whose validated range no
 //!   longer fits clamp to empty bytes.
-//! - **Ascending bases.** Segment bases are expected to be ascending and non-overlapping, as
-//!   produced by parking consecutive buffers of one stream. [`Store::park`] does not validate
-//!   this; see [`Store`](Store#segment-ordering) for how lookups behave when it does not hold.
-//! - **Empty spans.** A [`Span`] with zero length — including a reversed one — resolves
-//!   successfully against any store and yields empty bytes; an empty lease starts owned and pins
-//!   nothing.
 //! - **Thread safety.** [`Lease<B>`] and [`Store<B>`] are `Send`/`Sync` exactly when `B` is
 //!   `Send + Sync`. Reads never block promotion or retirement: a [`LeaseBytes`] guard snapshots
 //!   its own pin on the allocation, so guards nest freely and retirement completes immediately
@@ -76,15 +78,18 @@
 //! - [`Store`]: the owner side; parks segments, hands out leases, and decides when to retire.
 //! - [`Lease`]: the consumer side; a promotable view that reads uniformly in both states.
 //! - [`LeaseBytes`]: the zero-copy read guard returned by [`Lease::bytes`].
-//! - [`Span`]: absolute byte spans used to address bytes across parked segments.
+//! - [`Span`]: non-empty absolute byte spans used to address bytes across parked segments, with
+//!   [`SpanError`] for rejected bounds.
+//! - [`ParkError`] / [`ParkErrorKind`]: why [`Store::park`] rejected a buffer, carrying the
+//!   buffer back to the caller.
 
 mod lease;
 mod span;
 mod store;
 
 pub use lease::{Lease, LeaseBytes};
-pub use span::Span;
-pub use store::{SegmentId, Store};
+pub use span::{Error as SpanError, Span};
+pub use store::{ParkError, ParkErrorKind, SegmentId, Store};
 
 /// Compile-checks the README examples alongside the doctests.
 #[cfg(doctest)]

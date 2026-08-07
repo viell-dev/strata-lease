@@ -33,6 +33,10 @@ refcounting never grants.
   nest freely, never deadlock, and stay valid across concurrent promotion or retirement.
 - **Absolute spans**: segments are parked with a base offset, and `Span`s address bytes across the
   whole logical stream; `leases()` covers spans that straddle segment boundaries.
+- **Invalid states are unrepresentable**: `Span::new` rejects empty and reversed bounds, and
+  `park` rejects buffers that would break the store's invariants (empty, out of base order, or
+  unaddressable within `u64`) — handing the buffer back — so lookups never have to paper over a
+  malformed span or a misparked segment.
 - **Safe by refcounting**: dropping the `Store` without retiring never dangles a lease — loaned
   leases share ownership of their segment. Retirement is a memory-management action, not a safety
   requirement.
@@ -47,10 +51,10 @@ use strata_lease::{Span, Store};
 
 // The owner parks a buffer it has finished producing (e.g. a consumed reader buffer).
 let mut store = Store::new();
-store.park(0, b"key=value\n".to_vec());
+store.park(0, b"key=value\n".to_vec()).unwrap();
 
 // Consumers hold cheap leases instead of copies.
-let value = store.lease(Span::new(4, 9)).unwrap();
+let value = store.lease(Span::new(4, 9).unwrap()).unwrap();
 assert!(value.is_loaned());
 assert_eq!(&*value.bytes(), b"value");
 
@@ -71,8 +75,8 @@ where the waste justifies the copies:
 use strata_lease::{Span, Store};
 
 let mut store = Store::new();
-store.park(0, vec![b'x'; 8 * 1024]);
-let straggler = store.lease(Span::new(10, 26)).unwrap();
+store.park(0, vec![b'x'; 8 * 1024]).unwrap();
+let straggler = store.lease(Span::new(10, 26).unwrap()).unwrap();
 
 // 8 KiB retained for 16 live bytes: wasted ≥ 4 KiB, so the segment retires.
 assert_eq!(store.maintain(4 * 1024), 1);
@@ -97,12 +101,10 @@ reads, delayed reclamation) but can never cause memory unsafety.
 - **Stable buffers.** `B::as_ref` must return the same slice — same address, length, and
   contents — on every call. A misbehaving implementation safely degrades: reads whose validated
   range no longer fits clamp to empty bytes, and a panicking `as_ref` leaves promotion retryable.
-- **Ascending bases.** Bases should be ascending and non-overlapping, as produced by parking
-  consecutive buffers of one stream. `park` does not validate this; single-segment lookups still
-  resolve out of order, but cross-segment spans conservatively resolve to `None`, and overlaps
-  resolve to the first-parked segment.
-- **Empty spans.** Zero-length spans — including reversed ones — resolve successfully against any
-  store and yield empty bytes; an empty lease starts owned and pins nothing.
+- **Validated up front.** `Span::new` returns an error for empty or reversed bounds, and `park`
+  returns an error (carrying the buffer back) for empty, out-of-order, or `u64`-overflowing
+  segments, so a store only ever holds segments its lookups can honor. Gaps between segments are
+  fine; spans reaching into a gap resolve to `None`.
 - **Thread safety.** `Lease<B>` and `Store<B>` are `Send`/`Sync` exactly when `B` is
   `Send + Sync`. A `LeaseBytes` guard keeps the segment allocation alive on its own until dropped,
   even across retirement, so drop guards promptly rather than storing them.
