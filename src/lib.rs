@@ -14,12 +14,11 @@
 //!   validates the segment invariants up front — non-empty, ascending non-overlapping bases,
 //!   addressable within `u64` — and rejects anything else with a [`ParkError`] that hands the
 //!   buffer back.
-//! - [`Store::lease`] maps an absolute [`Span`] — non-empty by construction; [`Span::new`]
-//!   rejects empty and reversed bounds with a [`SpanError`] — to a [`Lease`]: a cheap, cloneable,
-//!   thread-safe
+//! - [`Store::lease`] maps an absolute [`Span`] to a [`Lease`]: a cheap, cloneable, thread-safe
 //!   handle that is either *loaned* (reads from the retained segment it pins) or *owned* (holds
-//!   its own copy). Consumers read through [`Lease::bytes`] and never need to care which state the
-//!   lease is in.
+//!   its own copy). Spans are non-empty by construction — [`Span::new`] rejects empty and
+//!   reversed bounds with a [`SpanError`]. Consumers read through [`Lease::bytes`] and never
+//!   need to care which state the lease is in.
 //! - The store tracks the live loaned bytes pinning each segment. When retaining a segment stops
 //!   being worth it, [`Store::maintain`] (threshold-driven), [`Store::retire`], or
 //!   [`Store::retire_all`] promote every surviving lease and release the segment.
@@ -54,11 +53,11 @@
 //!
 //! # Contracts
 //!
-//! Invalid inputs that can be rejected up front are: [`Span::new`] refuses empty and reversed
-//! bounds, and [`Store::park`] refuses segments that would break the store's ordering and
-//! addressability invariants. What remains below are runtime contracts; everything in this crate
-//! is safe code, and violating one degrades behavior (empty or truncated reads, delayed
-//! reclamation) but can never cause memory unsafety.
+//! Everything rejectable up front is rejected at construction: [`Span::new`] refuses empty and
+//! reversed bounds, and [`Store::park`] refuses segments that would break the store's ordering
+//! and addressability invariants. What remains below are runtime contracts; everything in this
+//! crate is safe code, and violating a contract degrades behavior (empty or truncated reads,
+//! delayed reclamation) but can never cause memory unsafety.
 //!
 //! - **Stable buffers.** `Store<B>` accepts any `B: AsRef<[u8]>` and trusts that `as_ref` returns
 //!   the same slice — same address, same length, same contents — on every call. An impl that
