@@ -109,3 +109,16 @@ fn lease_debug_reports_promotion_state() {
     lease.promote();
     assert!(format!("{lease:?}").contains("owned: true"));
 }
+
+#[test]
+fn saturated_live_byte_counter_stays_saturated() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let counter = AtomicUsize::new(usize::MAX.saturating_sub(1));
+    super::pin(&counter, 5);
+    assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+
+    // Unpinning from a saturated counter must not dip below the (unknown) true total.
+    super::unpin(&counter, 5);
+    assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+}

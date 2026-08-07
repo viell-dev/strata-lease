@@ -109,8 +109,9 @@ reads, delayed reclamation) but can never cause memory unsafety.
   `Send + Sync`. A `LeaseBytes` guard keeps the segment allocation alive on its own until dropped,
   even across retirement, so drop guards promptly rather than storing them.
 - **Advisory accounting.** Live-byte counters count lease ranges with multiplicity (overlapping
-  leases each contribute fully) and saturate instead of wrapping; they steer `maintain` and are
-  not a precise measure of covered bytes.
+  leases each contribute fully); they steer `maintain` and are not a precise measure of covered
+  bytes. They saturate instead of wrapping, and saturation is sticky, so the accounting error is
+  always conservative: a saturated segment is retained, never retired early.
 - **Identifier scope.** A `SegmentId` is only meaningful for the store that issued it; it stays
   valid (reporting the segment's settled state) after retirement and compaction.
 

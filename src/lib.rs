@@ -69,8 +69,10 @@
 //!   even while readers are active — the allocation itself is freed when the last outstanding
 //!   guard drops.
 //! - **Advisory accounting.** Per-segment live-byte counters count lease ranges with
-//!   multiplicity (overlapping leases each contribute fully), saturate instead of wrapping, and
-//!   only steer [`Store::maintain`]; they are not a precise measure of covered bytes.
+//!   multiplicity (overlapping leases each contribute fully) and only steer [`Store::maintain`];
+//!   they are not a precise measure of covered bytes. They saturate instead of wrapping, and
+//!   saturation is sticky, so the error stays conservative: a saturated segment is retained, not
+//!   retired early.
 //!
 //! # Crate organization
 //!

@@ -21,9 +21,16 @@ fn pin(live_bytes: &AtomicUsize, len: usize) {
 }
 
 /// Removes `len` pinned bytes from a segment's live-byte counter, saturating at zero.
+///
+/// Saturation is sticky: once the counter has clamped at `usize::MAX`, part of the pinned total
+/// has been lost, and subtracting from the clamped value could drive the counter *below* the true
+/// total — turning the advisory error non-conservative and retiring segments whose bytes are
+/// still loaned out. A saturated counter therefore stays saturated; the affected segment is
+/// simply never retired by [`Store::maintain`](crate::Store), while explicit retirement is
+/// unaffected.
 fn unpin(live_bytes: &AtomicUsize, len: usize) {
     let _ = live_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-        Some(live.saturating_sub(len))
+        (live != usize::MAX).then(|| live.saturating_sub(len))
     });
 }
 
