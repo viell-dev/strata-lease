@@ -26,6 +26,20 @@ impl SegmentId {
     }
 }
 
+/// Lifecycle state of a parked segment, reported by [`Store::status`].
+///
+/// A segment only ever moves forward: `Open` → `Sealed` → `Retired`. [`Store::park`] starts a
+/// segment at `Sealed`; [`Store::park_open`] starts it at `Open`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentStatus {
+    /// Retaining bytes; exempt from [`Store::maintain`] until sealed.
+    Open,
+    /// Retaining bytes; eligible for retirement by [`Store::maintain`].
+    Sealed,
+    /// Bytes released; the settled, terminal state.
+    Retired,
+}
+
 /// Why a buffer was rejected by [`Store::park`] or [`Store::park_open`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkErrorKind {
@@ -275,27 +289,22 @@ impl<B> Store<B> {
         })
     }
 
-    /// Returns whether `segment` has been retired.
-    #[must_use]
-    pub fn is_retired(&self, segment: SegmentId) -> Option<bool> {
-        if self.is_compacted(segment) {
-            return Some(true);
-        }
-
-        self.entry(segment).map(|entry| entry.retained().is_none())
-    }
-
-    /// Returns whether `segment` is sealed, and therefore eligible for [`Self::maintain`].
+    /// Returns the lifecycle state of `segment`, or `None` for identifiers this store never
+    /// issued.
     ///
-    /// Retired segments report `true`: there is nothing left to protect from a sweep.
+    /// Compacted segments answer [`SegmentStatus::Retired`]: identifiers stay valid for the
+    /// lifetime of the store that issued them.
     #[must_use]
-    pub fn is_sealed(&self, segment: SegmentId) -> Option<bool> {
+    pub fn status(&self, segment: SegmentId) -> Option<SegmentStatus> {
         if self.is_compacted(segment) {
-            return Some(true);
+            return Some(SegmentStatus::Retired);
         }
 
-        self.entry(segment)
-            .map(|entry| entry.retained().is_none_or(|retained| retained.sealed))
+        self.entry(segment).map(|entry| match entry {
+            Segment::Retained(retained) if retained.sealed => SegmentStatus::Sealed,
+            Segment::Retained(_) => SegmentStatus::Open,
+            Segment::Retired => SegmentStatus::Retired,
+        })
     }
 
     /// Marks an open segment as retirable by [`Self::maintain`].

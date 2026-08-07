@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Barrier};
 use std::thread;
-use strata_lease::{Lease, SegmentId, Span, Store};
+use strata_lease::{Lease, SegmentId, SegmentStatus, Span, Store};
 
 /// Iteration budget that keeps Miri runs tractable while stressing native runs harder.
 fn budget(miri: usize, native: usize) -> usize {
@@ -165,7 +165,9 @@ fn randomized_lifecycle_matches_reference_model() {
                     match store.lease(span) {
                         Some(lease) => held.push((lease, expected.to_vec())),
                         // The chunk was already retired; the span must really be gone.
-                        None => assert_eq!(store.is_retired(chunk.id), Some(true)),
+                        None => {
+                            assert_eq!(store.status(chunk.id), Some(SegmentStatus::Retired));
+                        }
                     }
                 }
                 // Promote a random held lease.
@@ -232,12 +234,12 @@ fn verify(store: &Store, chunks: &[Chunk], held: &[(Lease, Vec<u8>)], stream: &[
             panic!("chunk range should be inside the stream");
         };
 
-        match store.is_retired(chunk.id) {
-            Some(false) => {
+        match store.status(chunk.id) {
+            Some(SegmentStatus::Open | SegmentStatus::Sealed) => {
                 assert_eq!(store.bytes(span), Some(expected));
                 assert_eq!(store.copy_bytes(span), Some(expected.to_vec()));
             }
-            Some(true) => {
+            Some(SegmentStatus::Retired) => {
                 assert_eq!(store.bytes(span), None);
                 assert_eq!(store.copy_bytes(span), None);
             }

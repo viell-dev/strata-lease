@@ -1,4 +1,4 @@
-use super::{ParkErrorKind, Segment, SegmentId, Store};
+use super::{ParkErrorKind, Segment, SegmentId, SegmentStatus, Store};
 use crate::Span;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -201,7 +201,7 @@ fn retire_promotes_stragglers_and_releases_bytes() {
     assert_eq!(&*suffix.bytes(), b"suffix");
     assert_eq!(store.retained_len(), 0);
     assert_eq!(store.live_bytes(id), Some(0));
-    assert_eq!(store.is_retired(id), Some(true));
+    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
     assert_eq!(store.bytes(span(7, 12)), None);
     assert!(!store.retire(id));
 }
@@ -226,7 +226,7 @@ fn maintain_respects_waste_threshold() {
 
     assert_eq!(store.maintain(9), 0);
     assert!(lease.is_loaned());
-    assert_eq!(store.is_retired(id), Some(false));
+    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
 
     assert_eq!(store.maintain(8), 1);
     assert!(lease.is_owned());
@@ -256,12 +256,12 @@ fn maintain_skips_open_segments_until_sealed() {
     };
 
     assert_eq!(store.maintain(0), 0);
-    assert_eq!(store.is_retired(id), Some(false));
+    assert_eq!(store.status(id), Some(SegmentStatus::Open));
 
     assert!(store.seal(id));
 
     assert_eq!(store.maintain(0), 1);
-    assert_eq!(store.is_retired(id), Some(true));
+    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
 }
 
 #[test]
@@ -271,7 +271,7 @@ fn seal_of_unknown_segment_is_rejected() {
     assert!(!store.seal(SegmentId(7)));
     assert!(!store.retire(SegmentId(7)));
     assert_eq!(store.live_bytes(SegmentId(7)), None);
-    assert_eq!(store.is_retired(SegmentId(7)), None);
+    assert_eq!(store.status(SegmentId(7)), None);
 }
 
 #[test]
@@ -325,16 +325,16 @@ fn segment_accessors_report_span_and_seal_state() {
         panic!("park should succeed");
     };
 
-    assert_eq!(store.is_sealed(id), Some(false));
+    assert_eq!(store.status(id), Some(SegmentStatus::Open));
     assert_eq!(store.segment_span(id), Some(span(3, 8)));
 
     assert!(store.seal(id));
-    assert_eq!(store.is_sealed(id), Some(true));
+    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
 
     assert!(store.retire(id));
     assert_eq!(store.segment_span(id), None);
-    assert_eq!(store.is_sealed(id), Some(true));
-    assert_eq!(store.is_sealed(SegmentId(9)), None);
+    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
+    assert_eq!(store.status(SegmentId(9)), None);
     assert_eq!(store.segment_span(SegmentId(9)), None);
 }
 
@@ -346,7 +346,7 @@ fn maintain_zero_threshold_retires_fully_loaned_segments() {
     };
 
     assert_eq!(store.maintain(0), 1);
-    assert_eq!(store.is_retired(id), Some(true));
+    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
     assert!(lease.is_owned());
     assert_eq!(&*lease.bytes(), b"0123456789");
 }
@@ -368,11 +368,10 @@ fn retiring_in_order_compacts_tombstones_and_keeps_ids_stable() {
 
     // Identifiers stay valid and answer with their settled state.
     assert_eq!(store.len(), 3);
-    assert_eq!(store.is_retired(first), Some(true));
-    assert_eq!(store.is_retired(second), Some(true));
-    assert_eq!(store.is_retired(third), Some(false));
+    assert_eq!(store.status(first), Some(SegmentStatus::Retired));
+    assert_eq!(store.status(second), Some(SegmentStatus::Retired));
+    assert_eq!(store.status(third), Some(SegmentStatus::Sealed));
     assert_eq!(store.live_bytes(first), Some(0));
-    assert_eq!(store.is_sealed(first), Some(true));
     assert!(store.seal(first));
     assert!(!store.retire(first));
 
@@ -500,7 +499,7 @@ fn panicking_buffer_leaves_promotion_and_retirement_retryable() {
 
     // Owner-side retirement panics but must leave the segment retryable.
     assert!(catch_unwind(AssertUnwindSafe(|| store.retire(id))).is_err());
-    assert_eq!(store.is_retired(id), Some(false));
+    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
 
     poisoned.store(false, Ordering::Relaxed);
 

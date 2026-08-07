@@ -36,8 +36,9 @@ audit.
   so every constructed span covers at least one byte; conversions to
   `Range<u64>` and lexicographic ordering included. `SegmentId` identifies
   parked segments.
-- Owner-side inspection: `is_sealed(id)` reports maintenance eligibility and
-  `segment_span(id)` the absolute span a retained segment covers.
+- Owner-side inspection: `status(id)` reports a segment's lifecycle state
+  (`SegmentStatus::{Open, Sealed, Retired}`) and `segment_span(id)` the
+  absolute span a retained segment covers.
 - Project metadata following the `strata-reader` conventions: strict lint
   configuration (including `missing_docs`), Mozilla Public License 2.0, and a
   Minimum Supported Rust Version of **1.87.0** on Rust edition 2024.

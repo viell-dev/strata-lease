@@ -90,7 +90,7 @@ mod store;
 
 pub use lease::{Lease, LeaseBytes};
 pub use span::{Error as SpanError, Span};
-pub use store::{ParkError, ParkErrorKind, SegmentId, Store};
+pub use store::{ParkError, ParkErrorKind, SegmentId, SegmentStatus, Store};
 
 /// Compile-checks the README examples alongside the doctests.
 #[cfg(doctest)]
