@@ -1,463 +1,25 @@
-use super::{ParkErrorKind, Segment, SegmentId, SegmentStatus, Store};
-use crate::Span;
+//! Tests for the Store
+
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "Okay in tests"
+)]
+
+use super::*;
+use crate::span::tests::span;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
-fn span(start: u64, end: u64) -> Span {
-    match Span::new(start, end) {
-        Ok(span) => span,
-        Err(error) => panic!("test span {start}..{end} should be valid: {error}"),
-    }
+/// Iteration budget that keeps Miri runs tractable while stressing native runs harder.
+const fn budget(miri: usize, native: usize) -> usize {
+    if cfg!(miri) { miri } else { native }
 }
 
-fn park<B: AsRef<[u8]>>(store: &mut Store<B>, base: u64, bytes: B) -> SegmentId {
-    match store.park(base, bytes) {
-        Ok(id) => id,
-        Err(error) => panic!("test park at {base} should succeed: {error}"),
-    }
-}
-
-fn parked(text: &str) -> (Store, SegmentId) {
-    let mut store = Store::new();
-    let id = park(&mut store, 0, text.as_bytes().to_vec());
-
-    (store, id)
-}
-
-#[test]
-fn parked_segment_resolves_span_bytes() {
-    let (store, _) = parked("key=value\n");
-
-    assert_eq!(store.segment_count(), 1);
-    assert_eq!(store.retained_len(), 10);
-    assert_eq!(store.bytes(span(4, 9)), Some(b"value".as_slice()));
-    assert_eq!(store.bytes(span(4, 20)), None);
-}
-
-#[test]
-fn segment_bases_offset_span_lookup() {
-    let mut store = Store::new();
-    park(&mut store, 100, b"based".to_vec());
-
-    assert_eq!(store.bytes(span(101, 104)), Some(b"ase".as_slice()));
-    assert_eq!(store.bytes(span(99, 102)), None);
-}
-
-#[test]
-fn bytes_requires_a_single_containing_segment() {
-    let mut store = Store::new();
-    park(&mut store, 0, b"alpha".to_vec());
-    park(&mut store, 5, b"beta".to_vec());
-
-    assert_eq!(store.bytes(span(3, 7)), None);
-    assert_eq!(store.bytes(span(5, 9)), Some(b"beta".as_slice()));
-}
-
-#[test]
-fn park_rejects_empty_buffers() {
-    let mut store = Store::new();
-    let Err(error) = store.park(0, Vec::new()) else {
-        panic!("empty buffer should be rejected");
-    };
-
-    assert_eq!(error.kind(), ParkErrorKind::Empty);
-    assert_eq!(store.segment_count(), 0);
-    assert_eq!(error.into_bytes(), Vec::<u8>::new());
-}
-
-#[test]
-fn park_rejects_out_of_order_bases_and_returns_the_buffer() {
-    let mut store = Store::new();
-    park(&mut store, 0, b"alpha".to_vec());
-    let Err(error) = store.park(3, b"beta".to_vec()) else {
-        panic!("overlapping base should be rejected");
-    };
-
-    assert_eq!(
-        error.kind(),
-        ParkErrorKind::OutOfOrder {
-            base: 3,
-            min_base: 5,
-        }
-    );
-    assert_eq!(error.into_bytes(), b"beta".to_vec());
-    assert_eq!(store.segment_count(), 1);
-    assert_eq!(store.retained_len(), 5);
-}
-
-#[test]
-fn park_order_is_judged_against_retired_history_too() {
-    let mut store = Store::new();
-    let id = park(&mut store, 0, b"alpha".to_vec());
-
-    assert!(store.retire(id));
-
-    // The stream positions 0..5 were spoken for even though their bytes are gone.
-    let Err(error) = store.park(2, b"late".to_vec()) else {
-        panic!("base inside retired history should be rejected");
-    };
-    assert_eq!(
-        error.kind(),
-        ParkErrorKind::OutOfOrder {
-            base: 2,
-            min_base: 5,
-        }
-    );
-
-    assert_eq!(park(&mut store, 5, b"next".to_vec()).index(), 1);
-}
-
-#[test]
-fn park_rejects_unaddressable_tails() {
-    let mut store = Store::new();
-    let base = u64::MAX.saturating_sub(2);
-    let Err(error) = store.park(base, b"abcdef".to_vec()) else {
-        panic!("overflowing tail should be rejected");
-    };
-
-    assert_eq!(error.kind(), ParkErrorKind::Unaddressable { base, len: 6 });
-    assert_eq!(store.retained_len(), 0);
-    assert_eq!(store.segment_count(), 0);
-}
-
-#[test]
-fn park_allows_gaps_between_segments() {
-    let mut store = Store::new();
-    park(&mut store, 0, b"alpha".to_vec());
-    park(&mut store, 10, b"omega".to_vec());
-
-    assert_eq!(store.bytes(span(10, 15)), Some(b"omega".as_slice()));
-    assert_eq!(store.bytes(span(5, 7)), None);
-}
-
-#[test]
-fn lease_pins_live_bytes_until_dropped() {
-    let (mut store, id) = parked("0123456789");
-    let Some(lease) = store.lease(span(2, 6)) else {
-        panic!("span should be retained");
-    };
-
-    assert!(lease.is_loaned());
-    assert_eq!(&*lease.bytes(), b"2345");
-    assert_eq!(store.live_bytes(id), Some(4));
-
-    drop(lease);
-
-    assert_eq!(store.live_bytes(id), Some(0));
-}
-
-#[test]
-fn cloned_leases_share_one_pin() {
-    let (mut store, id) = parked("0123456789");
-    let Some(lease) = store.lease(span(0, 3)) else {
-        panic!("span should be retained");
-    };
-    let clone = lease.clone();
-
-    assert_eq!(store.live_bytes(id), Some(3));
-
-    drop(lease);
-
-    assert_eq!(store.live_bytes(id), Some(3));
-    assert_eq!(&*clone.bytes(), b"012");
-
-    drop(clone);
-
-    assert_eq!(store.live_bytes(id), Some(0));
-}
-
-#[test]
-fn consumer_promotion_unpins_without_retiring() {
-    let (mut store, id) = parked("consumer");
-    let Some(lease) = store.lease(span(0, 3)) else {
-        panic!("span should be retained");
-    };
-
-    lease.promote();
-
-    assert!(lease.is_owned());
-    assert_eq!(store.live_bytes(id), Some(0));
-    assert_eq!(store.retained_len(), 8);
-    assert_eq!(&*lease.bytes(), b"con");
-}
-
-#[test]
-fn retire_promotes_stragglers_and_releases_bytes() {
-    let (mut store, id) = parked("prefix:value:suffix");
-    let Some(value) = store.lease(span(7, 12)) else {
-        panic!("span should be retained");
-    };
-    let Some(suffix) = store.lease(span(13, 19)) else {
-        panic!("span should be retained");
-    };
-
-    assert!(store.retire(id));
-
-    assert!(value.is_owned());
-    assert!(suffix.is_owned());
-    assert_eq!(&*value.bytes(), b"value");
-    assert_eq!(&*suffix.bytes(), b"suffix");
-    assert_eq!(store.retained_len(), 0);
-    assert_eq!(store.live_bytes(id), Some(0));
-    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
-    assert_eq!(store.bytes(span(7, 12)), None);
-    assert!(!store.retire(id));
-}
-
-#[test]
-fn retire_all_reports_and_empties() {
-    let mut store = Store::new();
-    park(&mut store, 0, b"alpha".to_vec());
-    park(&mut store, 5, b"beta".to_vec());
-
-    assert_eq!(store.retire_all(), 2);
-    assert_eq!(store.retained_len(), 0);
-    assert_eq!(store.retire_all(), 0);
-}
-
-#[test]
-fn maintain_respects_waste_threshold() {
-    let (mut store, id) = parked("0123456789");
-    let Some(lease) = store.lease(span(2, 4)) else {
-        panic!("span should be retained");
-    };
-
-    assert_eq!(store.maintain(9), 0);
-    assert!(lease.is_loaned());
-    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
-
-    assert_eq!(store.maintain(8), 1);
-    assert!(lease.is_owned());
-    assert_eq!(&*lease.bytes(), b"23");
-    assert_eq!(store.retained_len(), 0);
-}
-
-#[test]
-fn maintain_counts_dropped_leases_as_waste() {
-    let (mut store, _) = parked("0123456789");
-    let Some(lease) = store.lease(span(0, 10)) else {
-        panic!("span should be retained");
-    };
-
-    assert_eq!(store.maintain(1), 0);
-
-    drop(lease);
-
-    assert_eq!(store.maintain(1), 1);
-}
-
-#[test]
-fn maintain_skips_open_segments_until_sealed() {
-    let mut store = Store::new();
-    let Ok(id) = store.park_open(0, b"open".to_vec()) else {
-        panic!("park should succeed");
-    };
-
-    assert_eq!(store.maintain(0), 0);
-    assert_eq!(store.status(id), Some(SegmentStatus::Open));
-
-    assert!(store.seal(id));
-
-    assert_eq!(store.maintain(0), 1);
-    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
-}
-
-#[test]
-fn seal_of_unknown_segment_is_rejected() {
-    let mut store = Store::<Vec<u8>>::new();
-
-    assert!(!store.seal(SegmentId(7)));
-    assert!(!store.retire(SegmentId(7)));
-    assert_eq!(store.live_bytes(SegmentId(7)), None);
-    assert_eq!(store.status(SegmentId(7)), None);
-}
-
-#[test]
-fn leases_can_cross_segment_boundaries() {
-    let mut store = Store::new();
-    let first = park(&mut store, 0, b"alpha".to_vec());
-    let second = park(&mut store, 5, b"beta".to_vec());
-    let Some(parts) = store.leases(span(3, 7)) else {
-        panic!("cross-segment span should be retained");
-    };
-    let [head, tail] = parts.as_slice() else {
-        panic!("expected one lease per segment");
-    };
-
-    assert_eq!(&*head.bytes(), b"ha");
-    assert_eq!(&*tail.bytes(), b"be");
-    assert_eq!(store.live_bytes(first), Some(2));
-    assert_eq!(store.live_bytes(second), Some(2));
-
-    store.retire_all();
-
-    assert_eq!(&*head.bytes(), b"ha");
-    assert_eq!(&*tail.bytes(), b"be");
-}
-
-#[test]
-fn copy_bytes_follows_fragmented_spans() {
-    let mut store = Store::new();
-    park(&mut store, 0, b"alpha".to_vec());
-    park(&mut store, 5, b"beta".to_vec());
-
-    assert_eq!(store.copy_bytes(span(3, 7)), Some(b"habe".to_vec()));
-    assert_eq!(store.copy_bytes(span(0, 5)), Some(b"alpha".to_vec()));
-    assert!(store.copy_bytes(span(3, 20)).is_none());
-}
-
-#[test]
-fn leases_with_a_gap_resolve_to_none_and_unpin() {
-    let mut store = Store::new();
-    let first = park(&mut store, 0, b"alpha".to_vec());
-    park(&mut store, 10, b"omega".to_vec());
-
-    assert!(store.leases(span(3, 12)).is_none());
-    assert_eq!(store.live_bytes(first), Some(0));
-}
-
-#[test]
-fn segment_accessors_report_span_and_seal_state() {
-    let mut store = Store::new();
-    let Ok(id) = store.park_open(3, b"hello".to_vec()) else {
-        panic!("park should succeed");
-    };
-
-    assert_eq!(store.status(id), Some(SegmentStatus::Open));
-    assert_eq!(store.segment_span(id), Some(span(3, 8)));
-
-    assert!(store.seal(id));
-    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
-
-    assert!(store.retire(id));
-    assert_eq!(store.segment_span(id), None);
-    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
-    assert_eq!(store.status(SegmentId(9)), None);
-    assert_eq!(store.segment_span(SegmentId(9)), None);
-}
-
-#[test]
-fn maintain_zero_threshold_retires_fully_loaned_segments() {
-    let (mut store, id) = parked("0123456789");
-    let Some(lease) = store.lease(span(0, 10)) else {
-        panic!("span should be retained");
-    };
-
-    assert_eq!(store.maintain(0), 1);
-    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
-    assert!(lease.is_owned());
-    assert_eq!(&*lease.bytes(), b"0123456789");
-}
-
-#[test]
-fn retiring_in_order_compacts_tombstones_and_keeps_ids_stable() {
-    let mut store = Store::new();
-    let first = park(&mut store, 0, b"aa".to_vec());
-    let second = park(&mut store, 2, b"bb".to_vec());
-    let third = park(&mut store, 4, b"cc".to_vec());
-
-    assert!(store.retire(second));
-    // A middle tombstone stays until everything ahead of it retires too.
-    assert_eq!(store.segments.len(), 3);
-
-    assert!(store.retire(first));
-    // The front and the already retired middle compact away together.
-    assert_eq!(store.segments.len(), 1);
-
-    // Identifiers stay valid and answer with their settled state.
-    assert_eq!(store.segment_count(), 3);
-    assert_eq!(store.status(first), Some(SegmentStatus::Retired));
-    assert_eq!(store.status(second), Some(SegmentStatus::Retired));
-    assert_eq!(store.status(third), Some(SegmentStatus::Sealed));
-    assert_eq!(store.live_bytes(first), Some(0));
-    assert!(store.seal(first));
-    assert!(!store.retire(first));
-
-    // New parks continue the identifier sequence past compacted history.
-    let fourth = park(&mut store, 6, b"dd".to_vec());
-    assert_eq!(fourth.index(), 3);
-    assert_eq!(store.bytes(span(4, 6)), Some(b"cc".as_slice()));
-    assert_eq!(store.bytes(span(6, 8)), Some(b"dd".as_slice()));
-}
-
-#[test]
-fn streaming_park_and_retire_runs_in_bounded_memory() {
-    let mut store = Store::new();
-
-    for round in 0..100u64 {
-        let id = park(&mut store, round.saturating_mul(4), b"data".to_vec());
-        assert!(store.retire(id));
-        assert!(store.segments.len() <= 1);
-    }
-
-    assert_eq!(store.segment_count(), 100);
-    assert_eq!(store.retained_len(), 0);
-}
-
-#[test]
-fn registry_stays_bounded_without_maintenance() {
-    let mut store = Store::new();
-    park(&mut store, 0, vec![b'x'; 64]);
-
-    let churn = if cfg!(miri) { 500 } else { 10_000 };
-
-    for _ in 0..churn {
-        let lease = store.lease(span(0, 8));
-        assert!(lease.is_some());
-        drop(lease);
-    }
-
-    let Some(Segment::Retained(retained)) = store.segments.front() else {
-        panic!("segment should be parked and retained");
-    };
-    assert!(
-        retained.leases.len() <= 8,
-        "registry should stay bounded, grew to {}",
-        retained.leases.len()
-    );
-}
-
-#[test]
-fn maintenance_prunes_promoted_leases_from_the_registry() {
-    let mut store = Store::new();
-    park(&mut store, 0, vec![b'x'; 64]);
-    let Some(lease) = store.lease(span(0, 8)) else {
-        panic!("span should be retained");
-    };
-
-    lease.promote();
-
-    // The threshold is unreachable, so nothing retires, but the sweep still prunes the
-    // promoted lease's registration while the lease itself stays alive.
-    assert_eq!(store.maintain(usize::MAX), 0);
-    let Some(Segment::Retained(retained)) = store.segments.front() else {
-        panic!("segment should be parked and retained");
-    };
-    assert!(retained.leases.is_empty());
-    assert_eq!(&*lease.bytes(), b"xxxxxxxx");
-}
-
-#[test]
-fn retire_completes_while_read_guards_are_held() {
-    let (mut store, id) = parked("guarded-read");
-    let Some(lease) = store.lease(span(0, 7)) else {
-        panic!("span should be retained");
-    };
-    let guard = lease.bytes();
-
-    // Retirement must not block on the same-thread guard.
-    assert!(store.retire(id));
-    assert_eq!(store.retained_len(), 0);
-
-    // The guard snapshot outlives retirement; fresh reads see the owned copy.
-    assert_eq!(&*guard, b"guarded");
-    drop(guard);
-    assert!(lease.is_owned());
-    assert_eq!(&*lease.bytes(), b"guarded");
-}
-
-/// Buffer whose `as_ref` panics while `poisoned` is set, emulating a faulty custom buffer.
+/// A buffer whose `as_ref` panics while `poisoned` is set, emulating a faulty custom buffer.
 struct FlakyBuffer {
     bytes: Vec<u8>,
     poisoned: Arc<AtomicBool>,
@@ -473,44 +35,7 @@ impl AsRef<[u8]> for FlakyBuffer {
     }
 }
 
-#[test]
-fn panicking_buffer_leaves_promotion_and_retirement_retryable() {
-    let poisoned = Arc::new(AtomicBool::new(false));
-    let mut store = Store::new();
-    let id = park(
-        &mut store,
-        0,
-        FlakyBuffer {
-            bytes: b"fragile".to_vec(),
-            poisoned: Arc::clone(&poisoned),
-        },
-    );
-    let Some(lease) = store.lease(span(0, 4)) else {
-        panic!("span should be retained");
-    };
-
-    poisoned.store(true, Ordering::Relaxed);
-
-    // Consumer-side promotion panics but must not corrupt the lease or its accounting.
-    assert!(catch_unwind(AssertUnwindSafe(|| lease.promote())).is_err());
-    assert!(lease.is_loaned());
-    assert_eq!(store.live_bytes(id), Some(4));
-
-    // Owner-side retirement panics but must leave the segment retryable.
-    assert!(catch_unwind(AssertUnwindSafe(|| store.retire(id))).is_err());
-    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
-
-    poisoned.store(false, Ordering::Relaxed);
-
-    // After the fault clears, everything proceeds normally despite the poisoned lock.
-    assert_eq!(&*lease.bytes(), b"frag");
-    assert!(store.retire(id));
-    assert!(lease.is_owned());
-    assert_eq!(&*lease.bytes(), b"frag");
-    assert_eq!(store.live_bytes(id), Some(0));
-}
-
-/// Buffer that violates the stability contract by shrinking to nothing on demand.
+/// A buffer that violates the stability contract by shrinking to nothing on demand.
 struct ShrinkingBuffer {
     bytes: Vec<u8>,
     shrunk: Arc<AtomicBool>,
@@ -526,49 +51,1290 @@ impl AsRef<[u8]> for ShrinkingBuffer {
     }
 }
 
-#[test]
-fn unstable_buffer_degrades_to_empty_reads_without_panicking() {
-    let shrunk = Arc::new(AtomicBool::new(false));
+/// A buffer type from outside the crate, boxed instead of a vector.
+struct Region {
+    bytes: Box<[u8]>,
+}
+
+impl AsRef<[u8]> for Region {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Deterministic xorshift generator so randomized failures replay exactly.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x.wrapping_shl(13);
+        x ^= x.wrapping_shr(7);
+        x ^= x.wrapping_shl(17);
+        self.0 = x;
+
+        x
+    }
+
+    /// Returns a value in `0..bound`, or `0` when `bound` is `0`.
+    fn below(&mut self, bound: usize) -> usize {
+        let bound = u64::try_from(bound.max(1)).unwrap();
+        usize::try_from(self.next() % bound).unwrap()
+    }
+}
+
+/// One parked chunk in the randomized reference model: its identifier and stream range.
+struct Chunk {
+    id: SegmentId,
+    start: usize,
+    end: usize,
+}
+
+/// Test helper to park `text` at base 0 in a fresh store.
+fn parked(text: &str) -> (Store, SegmentId) {
     let mut store = Store::new();
-    let id = park(
-        &mut store,
-        0,
-        ShrinkingBuffer {
-            bytes: b"unstable".to_vec(),
-            shrunk: Arc::clone(&shrunk),
-        },
+    let id = store.park(0, text.as_bytes().to_vec()).unwrap();
+
+    (store, id)
+}
+
+/// Test helper to build the identifier `index` would have in any store.
+const fn segment_id(index: u64) -> SegmentId {
+    SegmentId(index)
+}
+
+// -----------------------------------------------------------------------------
+// SegmentId
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_segment_id_index() {
+    let mut store = Store::new();
+
+    // Identifiers count parks from zero
+    assert_eq!(store.park(0, b"a".to_vec()).unwrap().index(), 0);
+    assert_eq!(store.park(1, b"b".to_vec()).unwrap().index(), 1);
+    assert_eq!(segment_id(7).index(), 7);
+}
+
+#[test]
+fn test_segment_id_ord() {
+    // Identifiers order by park order
+    assert!(segment_id(0) < segment_id(1));
+    assert_eq!(segment_id(3), segment_id(3));
+}
+
+/* Coverage note: `SegmentStatus` is a plain enum reported by `Store::status`.
+ * Its behavior is covered by the `status` tests.
+ */
+
+// -----------------------------------------------------------------------------
+// ParkErrorKind and ParkError
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_park_error_kind_display() {
+    // Each variant reports the rejected values
+    assert_eq!(
+        ParkErrorKind::Empty.to_string(),
+        "an empty buffer cannot be parked"
     );
-    let Some(lease) = store.lease(span(0, 8)) else {
-        panic!("span should be retained");
+    assert_eq!(
+        ParkErrorKind::OutOfOrder {
+            base: 3,
+            min_base: 5
+        }
+        .to_string(),
+        "base 3 starts before the end 5 of the previously parked segment"
+    );
+    assert_eq!(
+        ParkErrorKind::Unaddressable { base: 9, len: 2 }.to_string(),
+        "segment at base 9 with 2 bytes extends past the u64 address space"
+    );
+}
+
+#[test]
+fn test_park_error_kind() {
+    let error = ParkError {
+        kind: ParkErrorKind::Empty,
+        bytes: Vec::<u8>::new(),
     };
 
-    shrunk.store(true, Ordering::Relaxed);
+    assert_eq!(error.kind(), ParkErrorKind::Empty);
+}
 
-    // The validated range no longer fits; reads clamp to empty instead of panicking.
-    assert_eq!(&*lease.bytes(), b"");
-    assert_eq!(lease.len(), 0);
+#[test]
+fn test_park_error_into_bytes() {
+    let error = ParkError {
+        kind: ParkErrorKind::Empty,
+        bytes: b"returned".to_vec(),
+    };
 
-    lease.promote();
+    // The rejected buffer comes back intact
+    assert_eq!(error.into_bytes(), b"returned");
+}
 
+#[test]
+fn test_park_error_debug() {
+    let error = ParkError {
+        kind: ParkErrorKind::Empty,
+        bytes: b"hidden".to_vec(),
+    };
+
+    // Only the kind is printed, marked non-exhaustive with a trailing `..`
+    assert_eq!(format!("{error:?}"), "ParkError { kind: Empty, .. }");
+    assert!(!format!("{error:#?}").contains("hidden"));
+
+    // `B` needs no `Debug` implementation
+    let error = ParkError {
+        kind: ParkErrorKind::Empty,
+        bytes: Region {
+            bytes: Box::from(b"".as_slice()),
+        },
+    };
+    assert_eq!(format!("{error:?}"), "ParkError { kind: Empty, .. }");
+}
+
+#[test]
+fn test_park_error_display() {
+    let error = ParkError {
+        kind: ParkErrorKind::OutOfOrder {
+            base: 3,
+            min_base: 5,
+        },
+        bytes: Vec::<u8>::new(),
+    };
+
+    // The message is the kind's message
+    assert_eq!(error.to_string(), error.kind().to_string());
+}
+
+#[test]
+fn test_park_error_error() {
+    let error: Box<dyn Error> = Box::new(ParkError {
+        kind: ParkErrorKind::Empty,
+        bytes: Vec::<u8>::new(),
+    });
+
+    // The error is a leaf: it wraps no other error
+    assert!(error.source().is_none());
+}
+
+// -----------------------------------------------------------------------------
+// Segment
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_segment_retained() {
+    let (mut store, id) = parked("segment");
+
+    // A retained segment exposes its state, both ways
+    assert!(store.segments[0].retained().is_some());
+    assert!(store.segments[0].retained_mut().is_some());
+    assert!(!store.segments[0].is_retired());
+
+    store.segments[0].state = State::Retired;
+
+    // A retired one does not
+    assert!(store.segments[0].retained().is_none());
+    assert!(store.segments[0].retained_mut().is_none());
+    assert!(store.segments[0].is_retired());
+    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
+}
+
+#[test]
+fn test_segment_len() {
+    let mut store = Store::new();
+    store.park(100, b"0123456789".to_vec()).unwrap();
+
+    // The length comes from the span, not the base
+    assert_eq!(store.segments[0].len(), 10);
+
+    // And survives retirement
+    store.segments[0].state = State::Retired;
+    assert_eq!(store.segments[0].len(), 10);
+}
+
+#[test]
+fn test_segment_debug() {
+    let (mut store, id) = parked("debug");
+    let lease = store.lease(span(0, 3)).unwrap();
+
+    // Bookkeeping is printed; the bytes are not
+    assert_eq!(
+        format!("{:?}", store.segments[0]),
+        "Segment { span: Span { start: 0, end: 5 }, status: Sealed, registered_leases: 1, \
+         live_bytes: 3, .. }"
+    );
+    assert!(!format!("{:#?}", store.segments[0]).contains("debug"));
+
+    // The status reflects the seal flag
+    store.segments[0].retained_mut().unwrap().sealed = false;
+    assert!(format!("{:?}", store.segments[0]).contains("status: Open"));
+
+    // A tombstone prints only its span and status
+    drop(lease);
+    store.retire(id);
+    store.segments.push_back(Segment {
+        span: span(5, 6),
+        state: State::Retired,
+    });
+    assert_eq!(
+        format!("{:?}", store.segments[0]),
+        "Segment { span: Span { start: 5, end: 6 }, status: Retired }"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Retained
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_retained_prune() {
+    let (mut store, _) = parked("0123456789");
+    let live = store.lease(span(0, 2)).unwrap();
+    let dropped = store.lease(span(2, 4)).unwrap();
+    let promoted = store.lease(span(4, 6)).unwrap();
+    drop(dropped);
+    promoted.promote();
+
+    let retained = store.segments[0].retained_mut().unwrap();
+    assert_eq!(retained.leases.len(), 3);
+
+    retained.prune();
+
+    // Only the live loaned lease keeps its registration
+    assert_eq!(retained.leases.len(), 1);
+    assert!(!retained.leases[0].upgrade().unwrap().is_promoted());
+    drop(live);
+    assert!(retained.leases[0].upgrade().is_none());
+}
+
+#[test]
+fn test_retained_lease() {
+    let (mut store, id) = parked("0123456789");
+    let range = span(2, 6).segment_range(&span(0, 10)).unwrap();
+
+    // Leasing pins the range and registers the lease
+    let lease = store.segments[0].retained_mut().unwrap().lease(range);
+    assert_eq!(&*lease.bytes(), b"2345");
+    assert_eq!(store.live_bytes(id), Some(4));
+    assert_eq!(store.segments[0].retained().unwrap().leases.len(), 1);
+
+    // The registry only prunes when it is about to grow
+    drop(lease);
+    let retained = store.segments[0].retained_mut().unwrap();
+    let capacity = retained.leases.capacity();
+    while retained.leases.len() < capacity {
+        drop(retained.lease(range));
+    }
+    assert_eq!(retained.leases.len(), capacity);
+
+    // At capacity, the dead registrations are pruned before pushing instead of growing
+    let lease = retained.lease(range);
+    assert_eq!(retained.leases.len(), 1);
+    assert_eq!(retained.leases.capacity(), capacity);
+    assert!(retained.leases[0].upgrade().is_some());
+    drop(lease);
+    assert!(retained.leases[0].upgrade().is_none());
+
+    // So churn without maintenance keeps the registry bounded
+    for _ in 0..budget(500, 10_000) {
+        drop(store.lease(span(0, 8)).unwrap());
+    }
+    assert!(store.segments[0].retained().unwrap().leases.len() <= 8);
+}
+
+// -----------------------------------------------------------------------------
+// Store - Custom Derive-ables
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_store_default() {
+    let store: Store = Store::default();
+
+    // Default is a fresh store
+    assert!(store.segments.is_empty());
+    assert_eq!(store.compacted, 0);
+    assert_eq!(store.high_water, 0);
+}
+
+#[test]
+fn test_store_debug() {
+    let mut store = Store::new();
+    let first = store.park(0, b"hidden".to_vec()).unwrap();
+    store.park(6, b"second".to_vec()).unwrap();
+    store.retire(first);
+
+    let debug = format!("{store:?}");
+
+    // The bookkeeping is printed, including the compaction offset
+    assert!(debug.starts_with("Store { segments: ["));
+    assert!(debug.contains("Segment { span: Span { start: 6, end: 12 }, status: Sealed"));
+    assert!(debug.ends_with("compacted: 1, high_water: 12 }"));
+
+    // The bytes are not, and `B` needs no `Debug` implementation
+    assert!(!debug.contains("hidden"));
+    let mut store = Store::new();
+    store
+        .park(
+            0,
+            Region {
+                bytes: Box::from(b"region".as_slice()),
+            },
+        )
+        .unwrap();
+    assert!(format!("{store:?}").contains("status: Sealed"));
+}
+
+// -----------------------------------------------------------------------------
+// Store - Creation
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_store_new() {
+    let store: Store = Store::new();
+
+    // Check internal state matches expectations
+    assert!(store.segments.is_empty());
+    assert_eq!(store.compacted, 0);
+    assert_eq!(store.high_water, 0);
+}
+
+// -----------------------------------------------------------------------------
+// Store - Accessors
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_store_segment_count() {
+    let mut store = Store::new();
+
+    // Starts at zero
+    assert_eq!(store.segment_count(), 0);
+
+    // Counts parks
+    let first = store.park(0, b"aa".to_vec()).unwrap();
+    store.park(2, b"bb".to_vec()).unwrap();
+    assert_eq!(store.segment_count(), 2);
+
+    // Counts history: retirement and compaction do not decrease it
+    store.retire(first);
+    assert_eq!(store.compacted, 1);
+    assert_eq!(store.segment_count(), 2);
+    store.retire_all();
+    assert_eq!(store.segments.len(), 0);
+    assert_eq!(store.segment_count(), 2);
+}
+
+#[test]
+fn test_store_retained_len() {
+    let mut store = Store::new();
+
+    // Starts at zero
+    assert_eq!(store.retained_len(), 0);
+
+    // Sums retained segment lengths
+    let first = store.park(0, b"aaaa".to_vec()).unwrap();
+    let second = store.park(10, b"bbbbbb".to_vec()).unwrap();
+    assert_eq!(store.retained_len(), 10);
+
+    // Retired segments no longer count, compacted or not
+    store.retire(second);
+    assert_eq!(store.retained_len(), 4);
+    store.retire(first);
+    assert_eq!(store.retained_len(), 0);
+}
+
+#[test]
+fn test_store_live_bytes() {
+    let (mut store, id) = parked("0123456789");
+
+    // Nothing pinned yet
+    assert_eq!(store.live_bytes(id), Some(0));
+
+    // Leases pin their length, counted with multiplicity across overlapping leases
+    let head = store.lease(span(0, 4)).unwrap();
+    let overlap = store.lease(span(2, 6)).unwrap();
+    assert_eq!(store.live_bytes(id), Some(8));
+
+    // Clones share one pin
+    let clone = head.clone();
+    assert_eq!(store.live_bytes(id), Some(8));
+    drop(head);
+    assert_eq!(store.live_bytes(id), Some(8));
+    drop(clone);
+    assert_eq!(store.live_bytes(id), Some(4));
+
+    // Promotion releases the pin
+    overlap.promote();
+    assert_eq!(store.live_bytes(id), Some(0));
+
+    // Retired and compacted segments report zero; unknown identifiers report nothing
+    let lease = store.lease(span(0, 4)).unwrap();
+    store.retire(id);
+    assert_eq!(store.compacted, 1);
+    assert_eq!(store.live_bytes(id), Some(0));
+    assert_eq!(store.live_bytes(SegmentId(1)), None);
     assert!(lease.is_owned());
-    assert_eq!(&*lease.bytes(), b"");
+}
+
+#[test]
+fn test_store_status() {
+    let mut store = Store::new();
+    let open = store.park_open(0, b"open".to_vec()).unwrap();
+    let sealed = store.park(4, b"sealed".to_vec()).unwrap();
+
+    // Parking chooses the initial state
+    assert_eq!(store.status(open), Some(SegmentStatus::Open));
+    assert_eq!(store.status(sealed), Some(SegmentStatus::Sealed));
+
+    // The lifecycle only moves forward
+    store.seal(open);
+    assert_eq!(store.status(open), Some(SegmentStatus::Sealed));
+    store.retire(sealed);
+    assert_eq!(store.status(sealed), Some(SegmentStatus::Retired));
+    store.retire(open);
+    assert_eq!(store.status(open), Some(SegmentStatus::Retired));
+
+    // Compacted identifiers still answer; unknown identifiers do not
+    assert_eq!(store.compacted, 2);
+    assert_eq!(store.status(open), Some(SegmentStatus::Retired));
+    assert_eq!(store.status(segment_id(2)), None);
+}
+
+#[test]
+fn test_store_segment_span() {
+    let mut store = Store::new();
+    let first = store.park(3, b"hello".to_vec()).unwrap();
+    let second = store.park(8, b"world".to_vec()).unwrap();
+
+    // Retained segments report the span validated at parking
+    assert_eq!(store.segment_span(first), Some(span(3, 8)));
+    assert_eq!(store.segment_span(second), Some(span(8, 13)));
+
+    // Retired segments do not, whether or not they have compacted away
+    store.retire(second);
+    assert_eq!(store.segment_span(second), None);
+    store.retire(first);
+    assert_eq!(store.segment_span(first), None);
+
+    // Neither do unknown identifiers
+    assert_eq!(store.segment_span(segment_id(9)), None);
+}
+
+// -----------------------------------------------------------------------------
+// Store - Parking
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_store_park() {
+    let mut store = Store::new();
+
+    // A parked segment is sealed, addressable by its base, and advances the high-water mark
+    let first = store.park(100, b"based".to_vec()).unwrap();
+    assert_eq!(first.index(), 0);
+    assert_eq!(store.status(first), Some(SegmentStatus::Sealed));
+    assert_eq!(store.segments[0].span, span(100, 105));
+    assert_eq!(store.high_water, 105);
+    assert_eq!(store.bytes(span(101, 104)), Some(b"ase".as_slice()));
+    assert_eq!(store.bytes(span(99, 102)), None);
+
+    // A segment may follow directly or after a gap
+    store.park(105, b"next".to_vec()).unwrap();
+    let third = store.park(200, b"gap".to_vec()).unwrap();
+    assert_eq!(third.index(), 2);
+    assert_eq!(store.high_water, 203);
+    assert_eq!(store.bytes(span(200, 203)), Some(b"gap".as_slice()));
+    assert_eq!(store.bytes(span(150, 151)), None);
+
+    // An empty buffer is rejected and handed back
+    let error = store.park(203, Vec::new()).unwrap_err();
+    assert_eq!(error.kind(), ParkErrorKind::Empty);
+    assert_eq!(error.into_bytes(), Vec::<u8>::new());
+    assert_eq!(store.segment_count(), 3);
+
+    // Overlapping the previous segment is rejected and handed back
+    let error = store.park(202, b"late".to_vec()).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        ParkErrorKind::OutOfOrder {
+            base: 202,
+            min_base: 203,
+        }
+    );
+    assert_eq!(error.into_bytes(), b"late");
+    assert_eq!(store.segment_count(), 3);
+    assert_eq!(store.retained_len(), 12);
+
+    // Order is judged against retired history too: those positions were spoken for
+    store.retire_all();
+    let error = store.park(150, b"late".to_vec()).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        ParkErrorKind::OutOfOrder {
+            base: 150,
+            min_base: 203,
+        }
+    );
+    let fourth = store.park(203, b"resumed".to_vec()).unwrap();
+    assert_eq!(fourth.index(), 3);
+
+    // A tail past the address space is rejected and handed back
+    let base = u64::MAX - 2;
+    let error = store.park(base, b"abcdef".to_vec()).unwrap_err();
+    assert_eq!(error.kind(), ParkErrorKind::Unaddressable { base, len: 6 });
+    assert_eq!(error.into_bytes(), b"abcdef");
+    assert_eq!(store.segment_count(), 4);
+
+    // The very last bytes of the address space are still parkable
+    store.park(base, b"ab".to_vec()).unwrap();
+    assert_eq!(store.high_water, u64::MAX);
+    assert_eq!(store.bytes(span(base, u64::MAX)), Some(b"ab".as_slice()));
+
+    // But nothing after them
+    let error = store.park(u64::MAX, b"x".to_vec()).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        ParkErrorKind::Unaddressable {
+            base: u64::MAX,
+            len: 1
+        }
+    );
+}
+
+#[test]
+fn test_store_park_open() {
+    let mut store = Store::new();
+
+    // An open segment retains bytes like a sealed one, but sweeps leave it alone
+    let id = store.park_open(0, b"open".to_vec()).unwrap();
+    assert_eq!(store.status(id), Some(SegmentStatus::Open));
+    assert_eq!(store.bytes(span(0, 4)), Some(b"open".as_slice()));
+    assert_eq!(store.maintain(0), 0);
+    assert_eq!(store.status(id), Some(SegmentStatus::Open));
+
+    // The same validation applies
+    assert_eq!(
+        store.park_open(0, b"early".to_vec()).unwrap_err().kind(),
+        ParkErrorKind::OutOfOrder {
+            base: 0,
+            min_base: 4
+        }
+    );
+    assert_eq!(
+        store.park_open(4, Vec::new()).unwrap_err().kind(),
+        ParkErrorKind::Empty
+    );
+
+    // Explicit retirement ignores the seal state
+    assert!(store.retire(id));
+    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
+}
+
+#[test]
+fn test_store_seal() {
+    let mut store = Store::new();
+    let id = store.park_open(0, b"open".to_vec()).unwrap();
+
+    // Sealing makes the segment retirable by sweeps
+    assert!(store.seal(id));
+    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
+    assert_eq!(store.maintain(0), 1);
+
+    // Sealing a retired segment is a no-op that reports success, compacted or not
+    assert!(store.seal(id));
+    assert_eq!(store.compacted, 1);
+    let next = store.park(4, b"more".to_vec()).unwrap();
+    let last = store.park(8, b"last".to_vec()).unwrap();
+    store.retire(last);
+    assert!(store.seal(last));
+    assert_eq!(store.status(last), Some(SegmentStatus::Retired));
+    assert!(store.seal(next));
+
+    // Unknown identifiers are rejected
+    assert!(!store.seal(segment_id(3)));
+}
+
+// -----------------------------------------------------------------------------
+// Store - Lookup
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_store_entry() {
+    let mut store = Store::new();
+    let first = store.park(0, b"aa".to_vec()).unwrap();
+    let second = store.park(2, b"bb".to_vec()).unwrap();
+
+    // Identifiers index the resident segments
+    assert_eq!(store.entry(first).unwrap().span, span(0, 2));
+    assert_eq!(store.entry_mut(second).unwrap().span, span(2, 4));
+    assert!(store.entry(segment_id(2)).is_none());
+    assert!(!store.is_compacted(first));
+
+    // Compaction offsets the indexing
+    store.retire(first);
+    assert_eq!(store.compacted, 1);
+    assert!(store.is_compacted(first));
+    assert!(store.entry(first).is_none());
+    assert_eq!(store.entry(second).unwrap().span, span(2, 4));
+    assert_eq!(store.entry_mut(second).unwrap().span, span(2, 4));
+}
+
+#[test]
+fn test_store_position_after() {
+    let mut store = Store::new();
+    store.park(0, b"alpha".to_vec()).unwrap();
+    store.park(10, b"omega".to_vec()).unwrap();
+
+    // Offsets inside or before a segment find it
+    assert_eq!(store.position_after(0), 0);
+    assert_eq!(store.position_after(4), 0);
+    assert_eq!(store.position_after(5), 1);
+    assert_eq!(store.position_after(7), 1);
+    assert_eq!(store.position_after(10), 1);
+    assert_eq!(store.position_after(14), 1);
+
+    // Offsets past every segment land after the deque
+    assert_eq!(store.position_after(15), 2);
+    assert_eq!(store.position_after(u64::MAX), 2);
+
+    // An empty store has no positions
+    let store: Store = Store::new();
+    assert_eq!(store.position_after(0), 0);
+}
+
+#[test]
+fn test_store_containing() {
+    let mut store = Store::new();
+    store.park(0, b"alpha".to_vec()).unwrap();
+    store.park(10, b"omega".to_vec()).unwrap();
+
+    // A span inside one segment maps to that segment and its relative range
+    let (position, range) = store.containing(span(1, 4)).unwrap();
+    assert_eq!(position, 0);
+    assert_eq!(range.bounds(), 1..4);
+    let (position, range) = store.containing(span(12, 15)).unwrap();
+    assert_eq!(position, 1);
+    assert_eq!(range.bounds(), 2..5);
+
+    // Spans reaching past a segment, into a gap, or past the end do not map
+    assert!(store.containing(span(3, 7)).is_none());
+    assert!(store.containing(span(5, 7)).is_none());
+    assert!(store.containing(span(7, 12)).is_none());
+    assert!(store.containing(span(15, 16)).is_none());
+}
+
+#[test]
+fn test_store_bytes() {
+    let mut store = Store::new();
+    let first = store.park(0, b"alpha".to_vec()).unwrap();
+    store.park(5, b"beta".to_vec()).unwrap();
+
+    // Spans inside one segment resolve
+    assert_eq!(store.bytes(span(0, 5)), Some(b"alpha".as_slice()));
+    assert_eq!(store.bytes(span(1, 4)), Some(b"lph".as_slice()));
+    assert_eq!(store.bytes(span(5, 9)), Some(b"beta".as_slice()));
+
+    // Spans across segments or past them do not
+    assert_eq!(store.bytes(span(3, 7)), None);
+    assert_eq!(store.bytes(span(5, 20)), None);
+
+    // Neither do spans into a retired segment
+    store.retire(first);
+    assert_eq!(store.bytes(span(0, 5)), None);
+    assert_eq!(store.bytes(span(5, 9)), Some(b"beta".as_slice()));
+}
+
+#[test]
+fn test_store_ranges() {
+    let mut store = Store::new();
+    let first = store.park(0, b"alpha".to_vec()).unwrap();
+    let second = store.park(5, b"beta".to_vec()).unwrap();
+    store.park(20, b"gamma".to_vec()).unwrap();
+
+    // A span inside one segment maps to one range
+    let ranges = store.ranges(span(0, 5)).unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].0, 0);
+    assert_eq!(ranges[0].1.bounds(), 0..5);
+    let ranges = store.ranges(span(8, 9)).unwrap();
+    assert_eq!(ranges[0].0, 1);
+    assert_eq!(ranges[0].1.bounds(), 3..4);
+
+    // A span across consecutive segments maps to one range per segment
+    let ranges = store.ranges(span(3, 7)).unwrap();
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges[0].0, 0);
+    assert_eq!(ranges[0].1.bounds(), 3..5);
+    assert_eq!(ranges[1].0, 1);
+    assert_eq!(ranges[1].1.bounds(), 0..2);
+
+    // A span reaching into a gap, starting in one, or past the end does not map
+    assert!(store.ranges(span(3, 12)).is_none());
+    assert!(store.ranges(span(9, 10)).is_none());
+    assert!(store.ranges(span(12, 22)).is_none());
+    assert!(store.ranges(span(24, 26)).is_none());
+
+    // A retired segment in the middle breaks the coverage
+    store.retire(second);
+    assert!(store.ranges(span(3, 7)).is_none());
+    assert!(store.ranges(span(5, 6)).is_none());
+    assert_eq!(store.ranges(span(0, 5)).unwrap()[0].0, 0);
+    assert_eq!(store.ranges(span(20, 22)).unwrap()[0].0, 2);
+
+    // Positions index the resident deque, so they shift with compaction
+    store.retire(first);
+    assert_eq!(store.segments.len(), 1);
+    let ranges = store.ranges(span(20, 22)).unwrap();
+    assert_eq!(ranges[0].0, 0);
+    assert_eq!(ranges[0].1.bounds(), 0..2);
+}
+
+#[test]
+fn test_store_copy_bytes() {
+    let mut store = Store::new();
+    store.park(0, b"alpha".to_vec()).unwrap();
+    let second = store.park(5, b"beta".to_vec()).unwrap();
+    store.park(9, b"gamma".to_vec()).unwrap();
+
+    // Copies follow spans across any number of segments
+    assert_eq!(store.copy_bytes(span(0, 5)), Some(b"alpha".to_vec()));
+    assert_eq!(store.copy_bytes(span(3, 7)), Some(b"habe".to_vec()));
+    assert_eq!(store.copy_bytes(span(3, 11)), Some(b"habetaga".to_vec()));
+
+    // Spans not fully retained do not copy
+    assert_eq!(store.copy_bytes(span(3, 20)), None);
+    store.retire(second);
+    assert_eq!(store.copy_bytes(span(3, 11)), None);
+    assert_eq!(store.copy_bytes(span(9, 14)), Some(b"gamma".to_vec()));
+}
+
+// -----------------------------------------------------------------------------
+// Store - Leasing
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_store_lease() {
+    let (mut store, id) = parked("0123456789");
+
+    // The lease starts loaned and pins its length
+    let lease = store.lease(span(2, 6)).unwrap();
+    assert!(lease.is_loaned());
+    assert_eq!(&*lease.bytes(), b"2345");
+    assert_eq!(store.live_bytes(id), Some(4));
+    assert_eq!(store.segments[0].retained().unwrap().leases.len(), 1);
+
+    // Dropping it releases the pin
+    drop(lease);
+    assert_eq!(store.live_bytes(id), Some(0));
+
+    // Spans not inside one retained segment do not lease
+    assert!(store.lease(span(8, 12)).is_none());
+    assert!(store.lease(span(10, 11)).is_none());
+    store.retire(id);
+    assert!(store.lease(span(2, 6)).is_none());
+}
+
+#[test]
+fn test_store_leases() {
+    let mut store = Store::new();
+    let first = store.park(0, b"alpha".to_vec()).unwrap();
+    let second = store.park(5, b"beta".to_vec()).unwrap();
+    store.park(20, b"omega".to_vec()).unwrap();
+
+    // A span inside one segment yields one lease
+    let parts = store.leases(span(5, 9)).unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(&*parts[0].bytes(), b"beta");
+    drop(parts);
+
+    // A span across segments yields one lease per segment, each pinning its piece
+    let parts = store.leases(span(3, 7)).unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(&*parts[0].bytes(), b"ha");
+    assert_eq!(&*parts[1].bytes(), b"be");
+    assert_eq!(store.live_bytes(first), Some(2));
+    assert_eq!(store.live_bytes(second), Some(2));
+
+    // Retirement promotes every piece
+    store.retire_all();
+    assert!(parts.iter().all(Lease::is_owned));
+    assert_eq!(&*parts[0].bytes(), b"ha");
+    assert_eq!(&*parts[1].bytes(), b"be");
+
+    // A span reaching into a gap yields nothing, and pins nothing
+    let mut store = Store::new();
+    let first = store.park(0, b"alpha".to_vec()).unwrap();
+    store.park(10, b"omega".to_vec()).unwrap();
+    assert!(store.leases(span(3, 12)).is_none());
+    assert_eq!(store.live_bytes(first), Some(0));
+    assert!(store.segments[0].retained().unwrap().leases.is_empty());
+}
+
+// -----------------------------------------------------------------------------
+// Store - Retirement
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_store_retire() {
+    let (mut store, id) = parked("prefix:value:suffix");
+    let value = store.lease(span(7, 12)).unwrap();
+    let suffix = store.lease(span(13, 19)).unwrap();
+    let promoted = store.lease(span(0, 6)).unwrap();
+    promoted.promote();
+    let guard = value.bytes();
+
+    // Retiring promotes the surviving leases and releases the bytes, without blocking on guards
+    assert!(store.retire(id));
+    assert!(value.is_owned());
+    assert!(suffix.is_owned());
+    assert_eq!(&*value.bytes(), b"value");
+    assert_eq!(&*suffix.bytes(), b"suffix");
+    assert_eq!(&*promoted.bytes(), b"prefix");
+    assert_eq!(store.retained_len(), 0);
+    assert_eq!(store.live_bytes(id), Some(0));
+    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
+    assert_eq!(store.bytes(span(7, 12)), None);
+
+    // The guard taken beforehand keeps its snapshot
+    assert_eq!(&*guard, b"value");
+    drop(guard);
+
+    // Retiring again, or an unknown segment, reports nothing to do
+    assert!(!store.retire(id));
+    assert!(!store.retire(segment_id(1)));
+
+    // Open segments retire too
+    let open = store.park_open(19, b"open".to_vec()).unwrap();
+    assert!(store.retire(open));
+    assert_eq!(store.status(open), Some(SegmentStatus::Retired));
+}
+
+#[test]
+fn test_store_retire_all() {
+    let mut store = Store::new();
+    store.park(0, b"alpha".to_vec()).unwrap();
+    let open = store.park_open(5, b"beta".to_vec()).unwrap();
+    let lease = store.lease(span(0, 5)).unwrap();
+
+    // Every segment retires regardless of seal state, and the count is reported
+    assert_eq!(store.retire_all(), 2);
+    assert_eq!(store.retained_len(), 0);
+    assert_eq!(store.status(open), Some(SegmentStatus::Retired));
+    assert!(lease.is_owned());
+    assert_eq!(&*lease.bytes(), b"alpha");
+
+    // Nothing is left to retire; new parks are retired on the next call
+    assert_eq!(store.retire_all(), 0);
+    store.park(9, b"more".to_vec()).unwrap();
+    assert_eq!(store.retire_all(), 1);
+}
+
+#[test]
+fn test_store_maintain() {
+    let (mut store, id) = parked("0123456789");
+    let lease = store.lease(span(2, 4)).unwrap();
+
+    // Wasted bytes are the retained length minus the live loaned bytes: 10 - 2 = 8
+    assert_eq!(store.maintain(9), 0);
+    assert!(lease.is_loaned());
+    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
+    assert_eq!(store.maintain(8), 1);
+    assert!(lease.is_owned());
+    assert_eq!(&*lease.bytes(), b"23");
+    assert_eq!(store.retained_len(), 0);
+
+    // Dropped leases stop counting as live
+    let (mut store, _) = parked("0123456789");
+    let lease = store.lease(span(0, 10)).unwrap();
+    assert_eq!(store.maintain(1), 0);
+    drop(lease);
+    assert_eq!(store.maintain(1), 1);
+
+    // A zero threshold retires even fully loaned segments
+    let (mut store, id) = parked("0123456789");
+    let lease = store.lease(span(0, 10)).unwrap();
+    assert_eq!(store.maintain(0), 1);
+    assert_eq!(store.status(id), Some(SegmentStatus::Retired));
+    assert!(lease.is_owned());
+    assert_eq!(&*lease.bytes(), b"0123456789");
+
+    // Open segments are skipped until sealed
+    let mut store = Store::new();
+    let id = store.park_open(0, b"open".to_vec()).unwrap();
+    assert_eq!(store.maintain(0), 0);
+    assert_eq!(store.status(id), Some(SegmentStatus::Open));
+    store.seal(id);
+    assert_eq!(store.maintain(0), 1);
+
+    // Segments are judged independently, and the count covers only this call
+    let mut store = Store::new();
+    store.park(0, vec![b'a'; 100]).unwrap();
+    store.park(100, vec![b'b'; 10]).unwrap();
+    store.park(110, vec![b'c'; 100]).unwrap();
+    assert_eq!(store.maintain(50), 2);
+    assert_eq!(store.retained_len(), 10);
+    assert_eq!(store.maintain(50), 0);
+
+    // A sweep that retires nothing still prunes promoted and dropped registrations
+    let (mut store, _) = parked("0123456789");
+    let promoted = store.lease(span(0, 8)).unwrap();
+    drop(store.lease(span(0, 8)).unwrap());
+    promoted.promote();
+    assert_eq!(store.segments[0].retained().unwrap().leases.len(), 2);
+    assert_eq!(store.maintain(usize::MAX), 0);
+    assert!(store.segments[0].retained().unwrap().leases.is_empty());
+    assert_eq!(&*promoted.bytes(), b"01234567");
+
+    // A saturated counter keeps its segment from retiring by any positive threshold
+    let (mut store, id) = parked("0123456789");
+    store.segments[0]
+        .retained()
+        .unwrap()
+        .backing
+        .live_bytes
+        .store(usize::MAX, Ordering::Relaxed);
+    assert_eq!(store.maintain(1), 0);
+    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
+    assert!(store.retire(id));
+}
+
+#[test]
+fn test_store_compact() {
+    let mut store = Store::new();
+    let first = store.park(0, b"aa".to_vec()).unwrap();
+    let second = store.park(2, b"bb".to_vec()).unwrap();
+    let third = store.park(4, b"cc".to_vec()).unwrap();
+
+    // A middle tombstone stays until everything ahead of it retires too
+    assert!(store.retire(second));
+    assert_eq!(store.segments.len(), 3);
+    assert_eq!(store.compacted, 0);
+
+    // The front and the already retired middle compact away together
+    assert!(store.retire(first));
+    assert_eq!(store.segments.len(), 1);
+    assert_eq!(store.compacted, 2);
+
+    // Identifiers stay valid and answer with their settled state
+    assert_eq!(store.segment_count(), 3);
+    assert_eq!(store.status(first), Some(SegmentStatus::Retired));
+    assert_eq!(store.status(second), Some(SegmentStatus::Retired));
+    assert_eq!(store.status(third), Some(SegmentStatus::Sealed));
+    assert_eq!(store.live_bytes(first), Some(0));
+    assert!(store.seal(first));
+    assert!(!store.retire(first));
+
+    // New parks continue the identifier sequence past compacted history
+    let fourth = store.park(6, b"dd".to_vec()).unwrap();
+    assert_eq!(fourth.index(), 3);
+    assert_eq!(store.bytes(span(4, 6)), Some(b"cc".as_slice()));
+    assert_eq!(store.bytes(span(6, 8)), Some(b"dd".as_slice()));
+
+    // So a streaming park-and-retire loop runs in bounded memory
+    let mut store = Store::new();
+    for round in 0..budget(20, 100) {
+        let base = u64::try_from(round * 4).unwrap();
+        let id = store.park(base, b"data".to_vec()).unwrap();
+        assert!(store.retire(id));
+        assert!(store.segments.is_empty());
+    }
+    assert_eq!(
+        store.segment_count(),
+        u64::try_from(budget(20, 100)).unwrap()
+    );
+    assert_eq!(store.retained_len(), 0);
+}
+
+// -----------------------------------------------------------------------------
+// Store - Buffer contract
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_store_custom_buffer() {
+    let mut store = Store::new();
+    store
+        .park(
+            0,
+            Region {
+                bytes: Box::from(b"custom-buffer".as_slice()),
+            },
+        )
+        .unwrap();
+
+    // Any stable `AsRef<[u8]>` works like a vector
+    let lease = store.lease(span(0, 6)).unwrap();
+    assert_eq!(store.bytes(span(7, 13)), Some(b"buffer".as_slice()));
+    assert_eq!(store.retire_all(), 1);
+    assert_eq!(&*lease.bytes(), b"custom");
+}
+
+#[test]
+fn test_store_panicking_buffer() {
+    let poisoned = Arc::new(AtomicBool::new(false));
+    let mut store = Store::new();
+    let id = store
+        .park(
+            0,
+            FlakyBuffer {
+                bytes: b"fragile".to_vec(),
+                poisoned: Arc::clone(&poisoned),
+            },
+        )
+        .unwrap();
+    let lease = store.lease(span(0, 4)).unwrap();
+
+    poisoned.store(true, Ordering::Relaxed);
+
+    // Consumer-side promotion panics but must not corrupt the lease or its accounting
+    assert!(catch_unwind(AssertUnwindSafe(|| lease.promote())).is_err());
+    assert!(lease.is_loaned());
+    assert_eq!(store.live_bytes(id), Some(4));
+
+    // Owner-side retirement panics but must leave the segment retryable
+    assert!(catch_unwind(AssertUnwindSafe(|| store.retire(id))).is_err());
+    assert_eq!(store.status(id), Some(SegmentStatus::Sealed));
+    assert_eq!(store.retained_len(), 7);
+
+    poisoned.store(false, Ordering::Relaxed);
+
+    // After the fault clears, everything proceeds normally despite the poisoned lock
+    assert_eq!(&*lease.bytes(), b"frag");
+    assert!(store.retire(id));
+    assert!(lease.is_owned());
+    assert_eq!(&*lease.bytes(), b"frag");
     assert_eq!(store.live_bytes(id), Some(0));
 }
 
 #[test]
-fn dropping_the_store_keeps_loaned_leases_readable() {
+fn test_store_unstable_buffer() {
+    let shrunk = Arc::new(AtomicBool::new(false));
     let mut store = Store::new();
-    park(&mut store, 0, b"outlives".to_vec());
-    let Some(lease) = store.lease(span(0, 8)) else {
-        panic!("span should be retained");
-    };
+    let id = store
+        .park(
+            0,
+            ShrinkingBuffer {
+                bytes: b"unstable".to_vec(),
+                shrunk: Arc::clone(&shrunk),
+            },
+        )
+        .unwrap();
+    let lease = store.lease(span(0, 8)).unwrap();
+    assert_eq!(&*lease.bytes(), b"unstable");
+
+    shrunk.store(true, Ordering::Relaxed);
+
+    // The validated range no longer fits; reads clamp to empty instead of panicking
+    assert_eq!(&*lease.bytes(), b"");
+    assert_eq!(lease.len(), 0);
+    assert!(lease.is_empty());
+    assert_eq!(store.bytes(span(0, 8)), None);
+    assert_eq!(store.copy_bytes(span(0, 8)), None);
+
+    // Promotion copies what is there, and the accounting stays consistent
+    lease.promote();
+    assert!(lease.is_owned());
+    assert_eq!(&*lease.bytes(), b"");
+    assert_eq!(store.live_bytes(id), Some(0));
+    assert_eq!(store.retained_len(), 8);
+}
+
+#[test]
+fn test_store_drop() {
+    let mut store = Store::new();
+    store.park(0, b"outlives".to_vec()).unwrap();
+    let lease = store.lease(span(0, 8)).unwrap();
+    let guard = lease.bytes();
 
     drop(store);
 
+    // Without retirement the crate degrades to plain refcounting: nothing dangles
     assert!(lease.is_loaned());
     assert_eq!(&*lease.bytes(), b"outlives");
+    assert_eq!(&*guard, b"outlives");
 
     lease.promote();
-
     assert_eq!(&*lease.bytes(), b"outlives");
+}
+
+// -----------------------------------------------------------------------------
+// Store - Concurrency
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_store_retire_all_races_consumers() {
+    let spans = [span(0, 20), span(20, 40), span(40, 60), span(60, 80)];
+    let expected = b"0123456789".repeat(2);
+
+    for _ in 0..budget(4, 64) {
+        let mut store = Store::new();
+        store.park(0, b"0123456789".repeat(8)).unwrap();
+        let barrier = Arc::new(Barrier::new(spans.len() + 1));
+        let mut workers = Vec::new();
+
+        for span in spans {
+            let lease = store.lease(span).unwrap();
+            let barrier = Arc::clone(&barrier);
+
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                let clone = lease.clone();
+                let before = lease.to_vec();
+                let guard = clone.bytes();
+                lease.promote();
+                let held_across_promotion = guard.to_vec();
+                drop(guard);
+                let after = clone.to_vec();
+
+                (before, held_across_promotion, after)
+            }));
+        }
+
+        // The owner reclaims everything while every worker is mid-read/promote
+        barrier.wait();
+        store.retire_all();
+        assert_eq!(store.retained_len(), 0);
+
+        // Every interleaving yields the same bytes
+        for worker in workers {
+            let (before, held, after) = worker.join().unwrap();
+
+            assert_eq!(before, expected);
+            assert_eq!(held, expected);
+            assert_eq!(after, expected);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Store - Randomized lifecycle
+// -----------------------------------------------------------------------------
+
+/// Checks every held lease and the store's view of every chunk against the reference stream.
+fn verify(store: &Store, chunks: &[Chunk], held: &[(Lease, Vec<u8>)], stream: &[u8]) {
+    for (lease, expected) in held {
+        assert_eq!(&*lease.bytes(), expected.as_slice());
+        assert_eq!(lease.len(), expected.len());
+    }
+
+    for chunk in chunks {
+        let span = span(
+            u64::try_from(chunk.start).unwrap(),
+            u64::try_from(chunk.end).unwrap(),
+        );
+        let expected = &stream[chunk.start..chunk.end];
+
+        match store.status(chunk.id) {
+            Some(SegmentStatus::Open | SegmentStatus::Sealed) => {
+                assert_eq!(store.bytes(span), Some(expected));
+                assert_eq!(store.copy_bytes(span), Some(expected.to_vec()));
+            }
+            Some(SegmentStatus::Retired) => {
+                assert_eq!(store.bytes(span), None);
+                assert_eq!(store.copy_bytes(span), None);
+            }
+            None => panic!("chunk identifiers should stay valid"),
+        }
+    }
+}
+
+#[test]
+fn test_store_randomized_lifecycle() {
+    let stream: Vec<u8> = (0u64..)
+        .map(|index| u8::try_from(index.wrapping_mul(31) % 251).unwrap())
+        .take(budget(512, 8 * 1024))
+        .collect();
+
+    for seed in [
+        0x9E37_79B9_7F4A_7C15_u64,
+        0x0000_0000_0000_002A,
+        0x517C_C1B7_2722_0A95,
+    ] {
+        let mut rng = XorShift(seed);
+        let mut store = Store::new();
+        let mut chunks: Vec<Chunk> = Vec::new();
+
+        // Park the stream as consecutive chunks of random length
+        let mut offset = 0usize;
+        while offset < stream.len() {
+            let len = (rng.below(96) + 1).min(stream.len() - offset);
+            let end = offset + len;
+            let id = store
+                .park(u64::try_from(offset).unwrap(), stream[offset..end].to_vec())
+                .unwrap();
+            chunks.push(Chunk {
+                id,
+                start: offset,
+                end,
+            });
+            offset = end;
+        }
+
+        // Held leases with the bytes they must keep answering, whatever happens around them
+        let mut held: Vec<(Lease, Vec<u8>)> = Vec::new();
+
+        for step in 0..budget(256, 4096) {
+            match rng.next() % 8 {
+                // Lease a random subspan of a random chunk
+                0..=2 => {
+                    let chunk = &chunks[rng.below(chunks.len())];
+                    let a = chunk.start + rng.below(chunk.end - chunk.start);
+                    let b = (a + rng.below(24) + 1).min(chunk.end);
+                    let span = span(u64::try_from(a).unwrap(), u64::try_from(b).unwrap());
+
+                    match store.lease(span) {
+                        Some(lease) => held.push((lease, stream[a..b].to_vec())),
+                        // The chunk was already retired; the span must really be gone
+                        None => {
+                            assert_eq!(store.status(chunk.id), Some(SegmentStatus::Retired));
+                        }
+                    }
+                }
+                // Promote a random held lease
+                3 => {
+                    if let Some((lease, _)) = held.get(rng.below(held.len())) {
+                        lease.promote();
+                    }
+                }
+                // Clone a random held lease; the clone answers for the same bytes
+                4 => {
+                    if let Some((lease, expected)) = held.get(rng.below(held.len())) {
+                        let (lease, expected) = (lease.clone(), expected.clone());
+                        held.push((lease, expected));
+                    }
+                }
+                // Drop a random held lease
+                5 => {
+                    if !held.is_empty() {
+                        let index = rng.below(held.len());
+                        held.swap_remove(index);
+                    }
+                }
+                // Sweep with a random threshold
+                6 => {
+                    let _ = store.maintain(rng.below(128));
+                }
+                // Retire a random chunk outright
+                7 => {
+                    let _ = store.retire(chunks[rng.below(chunks.len())].id);
+                }
+                _ => unreachable!("op selector is modulo 8"),
+            }
+
+            // Periodically verify every held lease and the store's own view
+            if step % 16 == 0 {
+                verify(&store, &chunks, &held, &stream);
+            }
+        }
+
+        // Retiring everything leaves every held lease owned with its original bytes
+        store.retire_all();
+        assert_eq!(store.retained_len(), 0);
+        verify(&store, &chunks, &held, &stream);
+
+        for (lease, expected) in &held {
+            assert!(lease.is_owned());
+            assert_eq!(&*lease.bytes(), expected.as_slice());
+        }
+    }
 }

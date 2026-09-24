@@ -1,83 +1,198 @@
-use super::{Error, Span};
+//! Tests for the Span
 
-fn span(start: u64, end: u64) -> Span {
-    match Span::new(start, end) {
-        Ok(span) => span,
-        Err(error) => panic!("test span {start}..{end} should be valid: {error}"),
-    }
+#![expect(clippy::unwrap_used, reason = "Okay in tests")]
+
+use super::*;
+use std::error::Error;
+
+/// Test helper to build a span that is known to be valid.
+///
+/// # Panics
+///
+/// Panics if the bounds are empty or reversed, which is a bug in the test itself.
+pub(crate) fn span(start: u64, end: u64) -> Span {
+    Span::new(start, end).unwrap()
 }
 
-#[test]
-fn span_reports_bounds_and_length() {
-    assert_eq!(span(2, 6).start(), 2);
-    assert_eq!(span(2, 6).end(), 6);
-    assert_eq!(span(2, 6).len(), 4);
-}
+// -----------------------------------------------------------------------------
+// SpanError
+// -----------------------------------------------------------------------------
 
 #[test]
-fn empty_bounds_are_rejected() {
-    assert_eq!(Span::new(3, 3), Err(Error::Empty { position: 3 }));
-}
-
-#[test]
-fn reversed_bounds_are_rejected() {
-    assert_eq!(Span::new(6, 2), Err(Error::Reversed { start: 6, end: 2 }));
-}
-
-#[test]
-fn spans_convert_to_and_from_ranges() {
-    assert_eq!(Span::try_from(2..6), Ok(span(2, 6)));
-    assert_eq!(Span::try_from(4..4), Err(Error::Empty { position: 4 }));
-
-    let reversed = std::ops::Range { start: 9, end: 4 };
+fn test_span_error_display() {
+    // Each variant reports the offending bounds
     assert_eq!(
-        Span::try_from(reversed),
-        Err(Error::Reversed { start: 9, end: 4 })
-    );
-
-    assert_eq!(std::ops::Range::from(span(2, 6)), 2..6);
-}
-
-#[test]
-fn spans_order_by_start_then_end() {
-    assert!(span(1, 9) < span(2, 3));
-    assert!(span(2, 3) < span(2, 4));
-}
-
-#[test]
-fn errors_display_their_bounds() {
-    assert_eq!(
-        Error::Empty { position: 3 }.to_string(),
+        SpanError::Empty { position: 3 }.to_string(),
         "span at 3 is empty"
     );
     assert_eq!(
-        Error::Reversed { start: 6, end: 2 }.to_string(),
+        SpanError::Reversed { start: 6, end: 2 }.to_string(),
         "span end 2 precedes its start 6"
     );
 }
 
 #[test]
-fn segment_range_maps_contained_spans() {
-    let Some(range) = span(102, 104).segment_range(span(100, 105)) else {
-        panic!("contained span should map");
-    };
+fn test_span_error_error() {
+    let error: Box<dyn Error> = Box::new(SpanError::Empty { position: 3 });
 
-    assert_eq!(range.bounds(), 2..4);
-    assert_eq!(range.len(), 2);
+    // The error is a leaf: it wraps no other error
+    assert!(error.source().is_none());
+}
 
-    // A segment maps onto itself completely.
-    let Some(full) = span(100, 105).segment_range(span(100, 105)) else {
-        panic!("identical span should map");
-    };
-    assert_eq!(full.bounds(), 0..5);
+// -----------------------------------------------------------------------------
+// Span - Creation
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_span_new() {
+    // Forward bounds construct a span with the given offsets
+    let span = Span::new(2, 6).unwrap();
+    assert_eq!(span.start, 2);
+    assert_eq!(span.end, 6);
+
+    // A single byte is the smallest valid span
+    let span = Span::new(5, 6).unwrap();
+    assert_eq!(span.start, 5);
+    assert_eq!(span.end, 6);
+
+    // The full address space is a valid span
+    let span = Span::new(0, u64::MAX).unwrap();
+    assert_eq!(span.start, 0);
+    assert_eq!(span.end, u64::MAX);
+
+    // Equal bounds are rejected as empty
+    assert_eq!(Span::new(3, 3), Err(SpanError::Empty { position: 3 }));
+    assert_eq!(Span::new(0, 0), Err(SpanError::Empty { position: 0 }));
+
+    // Reversed bounds are rejected, even by one
+    assert_eq!(
+        Span::new(6, 2),
+        Err(SpanError::Reversed { start: 6, end: 2 })
+    );
+    assert_eq!(
+        Span::new(3, 2),
+        Err(SpanError::Reversed { start: 3, end: 2 })
+    );
 }
 
 #[test]
-fn segment_range_rejects_uncontained_spans() {
-    // Starts before the segment.
-    assert_eq!(span(99, 102).segment_range(span(100, 105)), None);
-    // Ends past the segment.
-    assert_eq!(span(103, 106).segment_range(span(100, 105)), None);
-    // Disjoint entirely.
-    assert_eq!(span(0, 1).segment_range(span(100, 105)), None);
+fn test_span_try_from_range() {
+    // Forward ranges convert
+    assert_eq!(Span::try_from(2..6), Ok(span(2, 6)));
+
+    // Empty and reversed ranges are rejected with the same errors as `new`
+    assert_eq!(Span::try_from(4..4), Err(SpanError::Empty { position: 4 }));
+    let reversed = Range { start: 9, end: 4 };
+    assert_eq!(
+        Span::try_from(reversed),
+        Err(SpanError::Reversed { start: 9, end: 4 })
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Span - Accessors
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_span_start() {
+    assert_eq!(span(2, 6).start(), 2);
+    assert_eq!(span(0, 1).start(), 0);
+}
+
+#[test]
+fn test_span_end() {
+    assert_eq!(span(2, 6).end(), 6);
+    assert_eq!(span(0, 1).end(), 1);
+}
+
+#[test]
+fn test_span_len() {
+    assert_eq!(span(2, 6).len(), 4);
+
+    // The smallest span covers one byte
+    assert_eq!(span(0, 1).len(), 1);
+
+    // The widest span covers the whole address space
+    assert_eq!(span(0, u64::MAX).len(), u64::MAX);
+}
+
+// -----------------------------------------------------------------------------
+// Span - Conversions and ordering
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_span_into_range() {
+    // The range round-trips the half-open bounds
+    assert_eq!(Range::from(span(2, 6)), 2..6);
+    assert_eq!(Span::try_from(Range::from(span(2, 6))), Ok(span(2, 6)));
+}
+
+#[test]
+fn test_span_ord() {
+    // Ordering is by start offset first
+    assert!(span(1, 9) < span(2, 3));
+
+    // Then by end offset
+    assert!(span(2, 3) < span(2, 4));
+
+    // Equal spans are equal in every respect
+    assert_eq!(span(2, 4), span(2, 4));
+    assert_eq!(span(2, 4).cmp(&span(2, 4)), std::cmp::Ordering::Equal);
+}
+
+// -----------------------------------------------------------------------------
+// Span - segment_range
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_span_segment_range() {
+    let segment = span(100, 105);
+
+    // A contained span maps to bounds relative to the segment base
+    let range = span(102, 104).segment_range(&segment).unwrap();
+    assert_eq!(range.bounds(), 2..4);
+    assert_eq!(range.len(), 2);
+
+    // A segment maps onto itself completely
+    let range = segment.segment_range(&segment).unwrap();
+    assert_eq!(range.bounds(), 0..5);
+    assert_eq!(range.len(), 5);
+
+    // The first and last bytes map individually
+    assert_eq!(
+        span(100, 101).segment_range(&segment).unwrap().bounds(),
+        0..1
+    );
+    assert_eq!(
+        span(104, 105).segment_range(&segment).unwrap().bounds(),
+        4..5
+    );
+
+    // Starting before the segment does not map
+    assert_eq!(span(99, 102).segment_range(&segment), None);
+
+    // Ending past the segment does not map
+    assert_eq!(span(103, 106).segment_range(&segment), None);
+
+    // A disjoint span does not map, on either side
+    assert_eq!(span(0, 1).segment_range(&segment), None);
+    assert_eq!(span(105, 106).segment_range(&segment), None);
+}
+
+// -----------------------------------------------------------------------------
+// SegmentRange
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_segment_range_len() {
+    let range = SegmentRange { start: 2, end: 4 };
+
+    assert_eq!(range.len(), 2);
+}
+
+#[test]
+fn test_segment_range_bounds() {
+    let range = SegmentRange { start: 2, end: 4 };
+
+    assert_eq!(range.bounds(), 2..4);
 }

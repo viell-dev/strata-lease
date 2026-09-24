@@ -1,4 +1,28 @@
 //! Promotable lease handles into retained segments.
+//!
+//! A [`Lease`] is the consumer side of the crate: a cheap, cloneable handle that reads from a
+//! segment retained by a [`Store`](crate::Store) until it is *promoted* to its own copy, either by
+//! the consumer or by the store when it retires the segment. [`Lease::bytes`] reads uniformly in
+//! both states through a [`LeaseBytes`] guard.
+//!
+//! # Example
+//!
+//! ```
+//! use strata_lease::{Span, Store};
+//!
+//! let mut store = Store::new();
+//! store.park(0, b"key=value\n".to_vec()).unwrap();
+//! let lease = store.lease(Span::new(4, 9).unwrap()).unwrap();
+//!
+//! // Loaned: reads straight from the retained segment
+//! assert!(lease.is_loaned());
+//! assert_eq!(&*lease.bytes(), b"value");
+//!
+//! // Owned: reads from a private copy, and the segment is no longer pinned
+//! lease.promote();
+//! assert!(lease.is_owned());
+//! assert_eq!(&*lease.bytes(), b"value");
+//! ```
 
 use crate::span::SegmentRange;
 use std::fmt::{self, Debug, Formatter};
@@ -8,12 +32,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 /// Adds `len` pinned bytes to a segment's live-byte counter, saturating at `usize::MAX`.
 ///
-/// The live-byte counters are advisory: they only steer [`Store::maintain`](crate::Store)
-/// decisions. Increments happen on the owner thread under `&mut Store` and decrements on
-/// arbitrary consumer threads, so `Relaxed` suffices: a stale or saturated value only makes
-/// maintenance conservative (a segment is retained longer than strictly necessary), never
-/// unsound. Saturation instead of wrapping keeps a pathological aggregate (overlapping leases
-/// summing past `usize::MAX`) from corrupting the counter into premature retirement.
+/// The live-byte counters are advisory: they only steer [`Store::maintain`](crate::Store::maintain)
+/// decisions. Increments happen on the owner side under `&mut Store` and decrements on arbitrary
+/// consumer threads, so `Relaxed` suffices: a stale or saturated value only makes maintenance
+/// conservative (a segment is retained longer than strictly necessary), never unsound. Saturation
+/// instead of wrapping keeps a pathological aggregate (overlapping leases summing past
+/// `usize::MAX`) from corrupting the counter into premature retirement.
 fn pin(live_bytes: &AtomicUsize, len: usize) {
     let _ = live_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
         Some(live.saturating_add(len))
@@ -24,10 +48,10 @@ fn pin(live_bytes: &AtomicUsize, len: usize) {
 ///
 /// Saturation is sticky: once the counter has clamped at `usize::MAX`, part of the pinned total
 /// has been lost, and subtracting from the clamped value could drive the counter *below* the true
-/// total — turning the advisory error non-conservative and retiring segments whose bytes are
+/// total. That would turn the advisory error non-conservative and retire segments whose bytes are
 /// still loaned out. A saturated counter therefore stays saturated; the affected segment is
-/// simply never retired by [`Store::maintain`](crate::Store), while explicit retirement is
-/// unaffected.
+/// simply never retired by [`Store::maintain`](crate::Store::maintain), while explicit retirement
+/// is unaffected.
 fn unpin(live_bytes: &AtomicUsize, len: usize) {
     let _ = live_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
         (live != usize::MAX).then(|| live.saturating_sub(len))
@@ -40,7 +64,9 @@ fn unpin(live_bytes: &AtomicUsize, len: usize) {
 /// never be wired to one segment's bytes and another segment's counter, and pinning a segment is
 /// one `Arc` instead of two.
 pub(crate) struct Backing<B> {
+    /// The parked buffer.
     pub(crate) bytes: B,
+    /// Bytes currently pinned by loaned leases, counted with multiplicity.
     pub(crate) live_bytes: AtomicUsize,
 }
 
@@ -50,13 +76,20 @@ pub(crate) struct Backing<B> {
 /// releases it: whoever takes the `Option` out of the mutex also subtracts the range length from
 /// the backing's live-byte counter. `owned` is only ever initialized while that mutex is held and
 /// *before* the source is taken, so a live slot always has a source, an owned copy, or both
-/// mid-promotion — never neither, even when a buffer's `as_ref` panics mid-copy.
+/// mid-promotion, never neither, even when a buffer's `as_ref` panics mid-copy.
 pub(crate) struct Slot<B> {
+    /// The promoted copy, set exactly once.
     owned: OnceLock<Arc<[u8]>>,
+    /// The pinned segment and the range within it, until promotion takes them.
     source: Mutex<Option<(Arc<Backing<B>>, SegmentRange)>>,
 }
 
 impl<B> Slot<B> {
+    /// Locks the source, recovering from poisoning.
+    ///
+    /// The only code that runs under this lock is the buffer's `as_ref` and an allocation, so a
+    /// poisoned lock means a buffer implementation panicked mid-promotion. The slot state is still
+    /// consistent then (see the type documentation), so continuing is safe.
     fn lock_source(&self) -> MutexGuard<'_, Option<(Arc<Backing<B>>, SegmentRange)>> {
         self.source.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -65,6 +98,7 @@ impl<B> Slot<B> {
     ///
     /// A promoted slot no longer needs owner-side promotion, so the store prunes it from the
     /// lease registry even while consumers still hold it.
+    #[inline]
     pub(crate) fn is_promoted(&self) -> bool {
         self.owned.get().is_some()
     }
@@ -112,8 +146,8 @@ impl<B> Drop for Slot<B> {
 
 /// A promotable zero-copy view into a segment retained by a [`Store`](crate::Store).
 ///
-/// A lease is either *loaned* — it reads directly from the retained segment and pins it through
-/// shared ownership — or *owned* — it holds its own copy of the bytes. Consumers read through
+/// A lease is either *loaned*, reading directly from the retained segment and pinning it through
+/// shared ownership, or *owned*, holding its own copy of the bytes. Consumers read through
 /// [`Lease::bytes`] in both states. Promotion happens in place, either from the consumer side via
 /// [`Lease::promote`] or from the owner side when the store retires the segment. Clones share one
 /// state and one pin, and dropping the last clone of a loaned lease releases its pin.
@@ -123,11 +157,20 @@ impl<B> Drop for Slot<B> {
 /// `Lease<B>` is `Send` and `Sync` exactly when `B` is `Send + Sync` (which `Vec<u8>` and other
 /// standard buffer types are). Reads, clones, promotion, and store-side retirement may race
 /// freely; every interleaving yields the same bytes.
+///
+/// # Trait semantics
+///
+/// Cloning shares the lease state: a promotion through any clone is visible through every clone,
+/// and the clones together hold one pin on the segment.
+///
+/// The `Debug` output reports the promotion state only; the bytes are not printed.
 pub struct Lease<B = Vec<u8>> {
+    /// The state shared by every clone of this lease.
     slot: Arc<Slot<B>>,
 }
 
 impl<B> Clone for Lease<B> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             slot: Arc::clone(&self.slot),
@@ -161,15 +204,41 @@ impl<B> Lease<B> {
     ///
     /// This is a snapshot: under a concurrent promotion it can report `true` an instant before
     /// the pin on the segment is released. Treat it as a hint, not a synchronization point.
-    #[must_use]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use strata_lease::{Span, Store};
+    /// let mut store = Store::new();
+    /// store.park(0, b"owned".to_vec()).unwrap();
+    /// let lease = store.lease(Span::new(0, 5).unwrap()).unwrap();
+    ///
+    /// assert!(!lease.is_owned());
+    /// lease.promote();
+    /// assert!(lease.is_owned());
+    /// ```
+    #[inline]
     pub fn is_owned(&self) -> bool {
-        self.slot.owned.get().is_some()
+        self.slot.is_promoted()
     }
 
     /// Returns whether the lease still reads from the retained segment.
     ///
     /// The inverse of [`Lease::is_owned`], with the same snapshot caveat.
-    #[must_use]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use strata_lease::{Span, Store};
+    /// let mut store = Store::new();
+    /// store.park(0, b"loaned".to_vec()).unwrap();
+    /// let lease = store.lease(Span::new(0, 6).unwrap()).unwrap();
+    ///
+    /// assert!(lease.is_loaned());
+    /// store.retire_all();
+    /// assert!(!lease.is_loaned());
+    /// ```
+    #[inline]
     pub fn is_loaned(&self) -> bool {
         !self.is_owned()
     }
@@ -177,13 +246,39 @@ impl<B> Lease<B> {
 
 impl<B: AsRef<[u8]>> Lease<B> {
     /// Returns the number of bytes the lease covers.
-    #[must_use]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use strata_lease::{Span, Store};
+    /// let mut store = Store::new();
+    /// store.park(0, b"key=value\n".to_vec()).unwrap();
+    /// let lease = store.lease(Span::new(4, 9).unwrap()).unwrap();
+    ///
+    /// assert_eq!(lease.len(), 5);
+    /// ```
+    #[inline]
     pub fn len(&self) -> usize {
         self.bytes().len()
     }
 
     /// Returns `true` when the lease covers no bytes.
-    #[must_use]
+    ///
+    /// A lease created from a [`Span`](crate::Span) always covers at least one byte, so this
+    /// only reports `true` when the parked buffer violated the stable-buffer contract and shrank
+    /// underneath a loaned lease (see [`Store`](crate::Store)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use strata_lease::{Span, Store};
+    /// let mut store = Store::new();
+    /// store.park(0, b"key=value\n".to_vec()).unwrap();
+    /// let lease = store.lease(Span::new(4, 9).unwrap()).unwrap();
+    ///
+    /// assert!(!lease.is_empty());
+    /// ```
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -191,14 +286,33 @@ impl<B: AsRef<[u8]>> Lease<B> {
     /// Returns the lease bytes without copying, whether loaned or owned.
     ///
     /// The returned guard is a snapshot: for a loaned lease it takes its own pin on the retained
-    /// segment, so reads never block promotion or retirement — not even on the same thread — and
+    /// segment, so reads never block promotion or retirement, not even on the same thread, and
     /// guards nest freely. A guard created before a promotion or retirement keeps reading the
     /// original allocation until it is dropped, with bytes identical to the promoted copy.
     ///
     /// Because a loaned guard keeps the whole segment allocation alive on its own, drop it once
     /// the read is done rather than storing it long-term; the lease itself is the cheap handle to
     /// keep.
-    #[must_use]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use strata_lease::{Span, Store};
+    /// let mut store = Store::new();
+    /// store.park(0, b"key=value\n".to_vec()).unwrap();
+    /// let lease = store.lease(Span::new(4, 9).unwrap()).unwrap();
+    ///
+    /// // The guard dereferences to the byte slice
+    /// let bytes = lease.bytes();
+    /// assert_eq!(&*bytes, b"value");
+    /// assert_eq!(bytes.first(), Some(&b'v'));
+    ///
+    /// // Guards nest, and stay valid across promotion
+    /// let again = lease.bytes();
+    /// lease.promote();
+    /// assert_eq!(&*bytes, b"value");
+    /// assert_eq!(&*again, b"value");
+    /// ```
     pub fn bytes(&self) -> LeaseBytes<B> {
         if let Some(owned) = self.slot.owned.get() {
             return LeaseBytes {
@@ -232,12 +346,47 @@ impl<B: AsRef<[u8]>> Lease<B> {
     /// the [`Store`](crate::Store). It is safe to call while [`LeaseBytes`] guards are alive,
     /// including guards on this same lease from this same thread; existing guards keep reading
     /// the original allocation until dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use strata_lease::{Span, Store};
+    /// let mut store = Store::new();
+    /// let id = store.park(0, b"key=value\n".to_vec()).unwrap();
+    /// let lease = store.lease(Span::new(4, 9).unwrap()).unwrap();
+    /// assert_eq!(store.live_bytes(id), Some(5));
+    ///
+    /// // The consumer takes its copy early; the segment is no longer pinned
+    /// lease.promote();
+    /// assert!(lease.is_owned());
+    /// assert_eq!(store.live_bytes(id), Some(0));
+    /// assert_eq!(&*lease.bytes(), b"value");
+    ///
+    /// // Promoting again is a no-op
+    /// lease.promote();
+    /// assert_eq!(&*lease.bytes(), b"value");
+    /// ```
+    #[inline]
     pub fn promote(&self) {
         self.slot.promote();
     }
 
     /// Copies the current lease bytes into a vector.
-    #[must_use]
+    ///
+    /// This does not change the lease state; use [`Lease::promote`] to release the pin.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use strata_lease::{Span, Store};
+    /// let mut store = Store::new();
+    /// store.park(0, b"key=value\n".to_vec()).unwrap();
+    /// let lease = store.lease(Span::new(4, 9).unwrap()).unwrap();
+    ///
+    /// assert_eq!(lease.to_vec(), b"value");
+    /// assert!(lease.is_loaned());
+    /// ```
+    #[inline]
     pub fn to_vec(&self) -> Vec<u8> {
         self.bytes().to_vec()
     }
@@ -246,15 +395,23 @@ impl<B: AsRef<[u8]>> Lease<B> {
 /// Zero-copy read guard returned by [`Lease::bytes`].
 ///
 /// Dereferences to the lease's byte slice in both lease states. The guard is a self-contained
-/// snapshot — a pin on the segment allocation for a loaned lease, a share of the promoted copy
-/// for an owned one (an `Arc` clone either way, never a borrow or a lock) — so it stays valid
+/// snapshot, a pin on the segment allocation for a loaned lease or a share of the promoted copy
+/// for an owned one (an `Arc` clone either way, never a borrow or a lock), so it stays valid
 /// across promotion and retirement, and even outlives the lease and the store.
+///
+/// # Trait semantics
+///
+/// The `Debug` output is that of the byte slice.
 pub struct LeaseBytes<B = Vec<u8>> {
+    /// The allocation the guard reads from.
     inner: Inner<B>,
 }
 
+/// The allocation a [`LeaseBytes`] guard pins.
 enum Inner<B> {
+    /// A share of the promoted copy.
     Owned(Arc<[u8]>),
+    /// A pin on the retained segment and the range within it.
     Loaned {
         backing: Arc<Backing<B>>,
         range: SegmentRange,
@@ -264,6 +421,7 @@ enum Inner<B> {
 impl<B: AsRef<[u8]>> Deref for LeaseBytes<B> {
     type Target = [u8];
 
+    #[inline]
     fn deref(&self) -> &[u8] {
         match &self.inner {
             Inner::Owned(bytes) => bytes,
@@ -275,6 +433,7 @@ impl<B: AsRef<[u8]>> Deref for LeaseBytes<B> {
 }
 
 impl<B: AsRef<[u8]>> AsRef<[u8]> for LeaseBytes<B> {
+    #[inline]
     fn as_ref(&self) -> &[u8] {
         self
     }
