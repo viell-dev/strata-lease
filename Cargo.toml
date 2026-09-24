@@ -17,6 +17,8 @@ include = [
   "src/span/tests.rs",
   "src/store.rs",
   "src/store/tests.rs",
+  "tests/consumer.rs",
+  "tests/hardening.rs",
   "Cargo.toml",
   "Cargo.lock",
   "CHANGELOG.md",

@@ -44,6 +44,18 @@ Single-crate library with three private modules, all re-exported at the crate ro
 
 Key design: the `Store` never blocks on consumers and consumers never need the `Store` to
 promote; both sides synchronize only through the per-lease `Slot`. Live-byte counters are
-advisory (`Relaxed`, saturating, sticky at saturation) and only ever err toward retaining. Tests
-live in nested `tests.rs` submodules per module (`src/<module>/tests.rs`), including the thread
-race and randomized reference-model coverage in `src/store/tests.rs`; the suite is Miri-clean.
+advisory (`Relaxed`, saturating, sticky at saturation) and only ever err toward retaining.
+
+## Tests
+
+Two kinds of tests, both Miri-clean:
+
+- **Unit tests** in nested `tests.rs` submodules per module (`src/<module>/tests.rs`), in the
+  `strata-reader` style: one white-box `test_<type>_<method>` per method walking its branches
+  with commented assertions, section banners, and coverage notes for thin wrappers.
+- **Integration tests** under `tests/`, public API only. Each test is one scenario named
+  `test_<scenario>` and told top to bottom: a `/* */` block sets the situation, then each step
+  carries a comment saying what the owner or consumer does and what it can rely on. They double
+  as usage examples (and are MIT-0 example material), so favor guidance over terseness.
+  `consumer.rs` holds the intended-use scenarios; `hardening.rs` holds the adversarial ones (the
+  barrier-forced retirement race and the randomized reference-model lifecycle).

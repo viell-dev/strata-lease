@@ -84,9 +84,10 @@ byte buffers through promotable leases.
 #### Project metadata
 
 - Crate-level documentation, README, and a doctest on every public method.
-- Unit tests in nested `tests.rs` submodules per module, including thread race
-  coverage and a randomized lifecycle checked against a reference model; the
-  suite is Miri-clean.
+- Unit tests in nested `tests.rs` submodules per module, plus integration
+  tests under `tests/` written as commented public-API scenarios: intended
+  use in `consumer.rs`, and the thread race and randomized reference-model
+  lifecycle in `hardening.rs`. The whole suite is Miri-clean.
 - `Cargo.toml` metadata including `repository`, `keywords`, `categories`,
   and a curated `include` list.
 - Strict lint configuration: `unsafe_code = "deny"`, `missing_docs`,

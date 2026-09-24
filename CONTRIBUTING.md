@@ -40,8 +40,10 @@ description:
 - The crate uses strict lints configured in `Cargo.toml`. Prefer
   `#[expect(lint, reason = "...")]` over `#[allow(lint)]`, and document safety around
   arithmetic, indexing, and unwrapping.
-- Unit tests live in nested `tests.rs` submodules per module (`src/<module>/tests.rs`); run
-  `cargo test` before submitting.
+- Unit tests live in nested `tests.rs` submodules per module (`src/<module>/tests.rs`) and
+  may inspect crate internals. Integration tests live under `tests/`, use the public API only,
+  and are written as commented scenarios that double as usage examples. Run `cargo test` before
+  submitting.
 
 ## Provenance
 
