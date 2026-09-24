@@ -44,17 +44,22 @@
 
   // Words to add to workspace dictionary:
   "cSpell.words": [
-    "bitmask",
     "clippy",
+    "misparked",
     "monomorphization",
     "monomorphize",
-    "multibyte",
-    "narratively",
-    "passthroughs",
-    "unconsume",
-    "Unconsumes",
-    "Unconsuming",
-    "viell"
+    "refcounting",
+    "retirable",
+    "retryable",
+    "straggler",
+    "stragglers",
+    "tombstone",
+    "tombstones",
+    "unpin",
+    "unpinned",
+    "unpins",
+    "viell",
+    "xorshift"
   ],
 
   // Words to ignore in spell-checking.
@@ -62,13 +67,7 @@
     "MSRV",
     "MSVC",
     "RAII",
-    "Swatinem",
     "VecDeque",
-    "bufread",
-    "dtolnay",
-    "dynbufread",
-    "expl_impl_clone_on_copy",
-    "linkedlist",
     "rustc",
     "rustdoc",
     "rustfmt",

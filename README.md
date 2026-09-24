@@ -1,18 +1,22 @@
 # strata-lease
 
-Revocable zero-copy sharing: promotable leases into retained byte buffers.
+Revocable zero-copy sharing of retained byte buffers through promotable leases.
 
 A data owner hands out cheap views into memory it retains instead of copies. Normally that pins the
 memory: plain borrowing pins it for as long as any view exists, and reference counting (`Arc`,
 `bytes::Bytes`) keeps the whole allocation alive until the last view dies, so one tiny straggler can
 pin megabytes. This crate sits between the two. Sharing is reference counted, but every view is a
-`Lease` that can be _promoted_ — switched in place from pointing into the retained buffer to holding
+`Lease` that can be _promoted_: switched in place from pointing into the retained buffer to holding
 its own small copy. That gives the owner an escape hatch neither model allows: promote the
 stragglers, then free the large allocation unconditionally.
 
 The trade in one line: zero-copy in the common case, and a small copy only for leases that outlive
-the buffer's usefulness — the owner regains the right to free its memory, which plain borrowing or
-refcounting never grants.
+the buffer's usefulness. The owner regains the right to free its memory, which plain borrowing or
+reference counting never grants.
+
+This is intended for parsers, tokenizers, protocol decoders, and other producers that retain large
+input buffers whose consumers keep small pieces alive for an unpredictable time. The crate has no
+dependencies and no `unsafe` code.
 
 ## Features
 
@@ -20,26 +24,26 @@ refcounting never grants.
   the retained segment it pins) or _owned_ (holds its own copy). `lease.bytes()` reads uniformly
   in both states; consumers never need to know which one they are in.
 - **Owner-side reclamation**: `retire(id)` and `retire_all()` promote every surviving lease in
-  place and release the segment unconditionally — without ever blocking on active readers.
+  place and release the segment unconditionally, without ever blocking on active readers.
   `maintain(min_wasted_bytes)` retires segments once their wasted (retained minus live loaned)
   bytes reach a threshold.
 - **O(1) retirement checks**: each lease's pin is tracked in a shared per-segment live-byte
   counter, decremented automatically when a lease is dropped or promoted, so `maintain` never has
-  to walk the lease registry to decide whether retiring pays off (its registry-pruning pass still
-  touches each registration).
+  to walk the lease registry to decide whether retiring pays off.
 - **Consumer-side promotion**: `lease.promote()` takes the copy early and releases the pin without
-  involving the store — useful at an ownership boundary such as a resolver or deserializer.
+  involving the store, which suits an ownership boundary such as a resolver or deserializer.
 - **Non-blocking reads**: `lease.bytes()` returns a snapshot guard holding its own pin, so guards
   nest freely, never deadlock, and stay valid across concurrent promotion or retirement.
 - **Absolute spans**: segments are parked with a base offset, and `Span`s address bytes across the
-  whole logical stream; `leases()` covers spans that straddle segment boundaries.
+  whole logical stream. Lookups binary-search the parked segments, and `leases()` covers spans
+  that straddle segment boundaries.
 - **Invalid states are unrepresentable**: `Span::new` rejects empty and reversed bounds, and
   `park` rejects buffers that would break the store's invariants (empty, out of base order, or
-  unaddressable within `u64`) — handing the buffer back — so lookups never have to paper over a
+  unaddressable within `u64`), handing the buffer back, so lookups never have to paper over a
   malformed span or a misparked segment.
-- **Safe by refcounting**: dropping the `Store` without retiring never dangles a lease — loaned
-  leases share ownership of their segment. Retirement is a memory-management action, not a safety
-  requirement.
+- **Safe by reference counting**: dropping the `Store` without retiring never dangles a lease,
+  because loaned leases share ownership of their segment. Retirement is a memory-management
+  action, not a safety requirement.
 - **Bounded bookkeeping**: lease registries prune themselves as leases are handed out, and the
   tombstones of retired segments compact away once everything parked before them retires, so a
   streaming park-and-retire loop runs in bounded memory.
@@ -49,17 +53,17 @@ refcounting never grants.
 ```rust
 use strata_lease::{Span, Store};
 
-// The owner parks a buffer it has finished producing (e.g. a consumed reader buffer).
+// The owner parks a buffer it has finished producing (e.g. a consumed reader buffer)
 let mut store = Store::new();
 store.park(0, b"key=value\n".to_vec()).unwrap();
 
-// Consumers hold cheap leases instead of copies.
+// Consumers hold cheap leases instead of copies
 let value = store.lease(Span::new(4, 9).unwrap()).unwrap();
 assert!(value.is_loaned());
 assert_eq!(&*value.bytes(), b"value");
 
-// Retaining ten bytes for a five-byte straggler is no longer worth it: retire.
-// The lease takes its own copy in place and the store releases the buffer.
+/* Retaining ten bytes for a five-byte straggler is no longer worth it: retire. The lease takes
+its own copy in place and the store releases the buffer. */
 store.retire_all();
 assert!(value.is_owned());
 assert_eq!(&*value.bytes(), b"value");
@@ -78,28 +82,27 @@ let mut store = Store::new();
 store.park(0, vec![b'x'; 8 * 1024]).unwrap();
 let straggler = store.lease(Span::new(10, 26).unwrap()).unwrap();
 
-// 8 KiB retained for 16 live bytes: wasted ≥ 4 KiB, so the segment retires.
+// 8 KiB retained for 16 live bytes: wasted >= 4 KiB, so the segment retires
 assert_eq!(store.maintain(4 * 1024), 1);
 assert!(straggler.is_owned());
 assert_eq!(store.retained_len(), 0);
 ```
 
-`park_open` / `seal` cover streaming producers: an open segment is exempt from `maintain`, so a
+`park_open` and `seal` cover streaming producers: an open segment is exempt from `maintain`, so a
 sweep cannot retire a buffer that was parked ahead of attaching its leases.
 
 ## Buffer types
 
 `Store<B>` and `Lease<B>` are generic over any `B: AsRef<[u8]>` and default to `Vec<u8>`, so the
-crate has no dependencies and works with plain vectors, `Box<[u8]>`, memory-mapped buffers, or
-reader-owned buffer types.
+crate works with plain vectors, `Box<[u8]>`, memory-mapped buffers, or reader-owned buffer types.
 
 ## Contracts and caveats
 
 Everything in the crate is safe code; breaking a contract degrades behavior (empty or truncated
 reads, delayed reclamation) but can never cause memory unsafety.
 
-- **Stable buffers.** `B::as_ref` must return the same slice — same address, length, and
-  contents — on every call. A misbehaving implementation safely degrades: reads whose validated
+- **Stable buffers.** `B::as_ref` must return the same slice (same address, length, and
+  contents) on every call. A misbehaving implementation safely degrades: reads whose validated
   range no longer fits clamp to empty bytes, and a panicking `as_ref` leaves promotion retryable.
 - **Validated up front.** `Span::new` returns an error for empty or reversed bounds, and `park`
   returns an error (carrying the buffer back) for empty, out-of-order, or `u64`-overflowing
