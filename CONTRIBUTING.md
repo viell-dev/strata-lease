@@ -44,8 +44,19 @@ description:
   arithmetic, indexing, and unwrapping.
 - Unit tests live in nested `tests.rs` submodules per module (`src/<module>/tests.rs`) and
   may inspect crate internals. Integration tests live under `tests/`, use the public API only,
-  and are written as commented scenarios that double as usage examples. Run `cargo test` before
-  submitting.
+  and are written as commented scenarios that double as usage examples.
+- Before submitting, run the fast checks with the development compiler:
+
+  ```bash
+  cargo fmt --check
+  cargo clippy --all-targets --all-features -- -D warnings
+  cargo test --all-targets --all-features
+  cargo test --doc --all-features
+  RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+  ```
+
+  Releases also check the declared minimum compiler and the packaged source; that procedure is
+  in [RELEASING.md](RELEASING.md).
 
 ## Provenance
 
