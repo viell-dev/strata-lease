@@ -56,7 +56,7 @@ description:
   ```
 
   Releases also check the minimum supported compiler and the packaged source; see
-  [RELEASING.md](RELEASING.md).
+  [RELEASING.md](https://codeberg.org/Devious-Concepts/strata-lease/src/branch/main/RELEASING.md).
 
 ## Provenance
 
