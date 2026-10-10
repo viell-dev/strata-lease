@@ -98,4 +98,4 @@ byte buffers through promotable leases.
   contribution policy in `CONTRIBUTING.md`.
 - Minimum Supported Rust Version of **1.87.0** on Rust edition 2024.
 
-[Unreleased]: https://codeberg.org/Devious-Concepts/strata-lease/commits/branch/main
+[Unreleased]: https://github.com/viell-dev/strata-lease/commits/main
