@@ -2,7 +2,7 @@
 name = "strata-lease"
 version = "0.1.0"
 edition = "2024"
-repository = "https://codeberg.org/Devious-Concepts/strata-lease"
+repository = "https://github.com/viell-dev/strata-lease"
 rust-version = "1.87.0"
 description = "Revocable zero-copy sharing of retained byte buffers through promotable leases"
 keywords = ["zero-copy", "buffer", "lease", "memory", "sharing"]
