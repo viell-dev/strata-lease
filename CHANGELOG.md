@@ -57,8 +57,9 @@ byte buffers through promotable leases.
 - Segment lookups binary-search the parked segments by offset.
 - Retired segments leave a tombstone so identifiers stay stable; leading
   tombstones compact away automatically, so a streaming park-and-retire loop
-  runs in bounded memory. Lease registries prune themselves amortized as
-  leases are handed out.
+  runs in bounded memory. Lease registries prune themselves as leases are
+  handed out, at amortized O(1) cost per lease even when most leases are
+  long-lived.
 
 #### Consumer-side operations
 

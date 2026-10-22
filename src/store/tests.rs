@@ -73,6 +73,46 @@ const fn segment_id(index: u64) -> SegmentId {
     SegmentId(index)
 }
 
+/// Test helper counting the registry entries pruning visits while `kept` leases stay loaned and
+/// one more is created `rounds` times, then dropped or promoted and kept alive.
+///
+/// `Retained::lease` prunes exactly when it registers into a full registry, and a prune visits
+/// every registration, so the registry length at those moments sums to the visits.
+#[expect(clippy::arithmetic_side_effects, reason = "Bounded test sizes")]
+fn prune_visits(kept: usize, rounds: usize, promote: bool) -> usize {
+    let mut store = Store::new();
+    store.park(0, vec![0; kept + 1]).unwrap();
+    let held: Vec<_> = (0..u64::try_from(kept).unwrap())
+        .map(|index| store.lease(span(index, index + 1)).unwrap())
+        .collect();
+    let tail = u64::try_from(kept).unwrap();
+    let range = span(tail, tail + 1)
+        .segment_range(&span(0, tail + 1))
+        .unwrap();
+    let retained = store.segments[0].retained_mut().unwrap();
+    let mut promoted = Vec::new();
+    let mut visits = 0;
+
+    for _ in 0..rounds {
+        if retained.leases.len() == retained.leases.capacity() {
+            visits += retained.leases.len();
+        }
+
+        let lease = retained.lease(range);
+        if promote {
+            lease.promote();
+            promoted.push(lease);
+        }
+    }
+
+    // However the churned leases end, the registry stays proportional to the loaned ones
+    assert!(retained.leases.capacity() <= 4 * (kept + 1));
+    assert_eq!(store.live_bytes(segment_id(0)), Some(kept));
+    drop(held);
+
+    visits
+}
+
 // -----------------------------------------------------------------------------
 // SegmentId
 // -----------------------------------------------------------------------------
@@ -313,6 +353,23 @@ fn test_retained_lease() {
         drop(store.lease(span(0, 8)).unwrap());
     }
     assert!(store.segments[0].retained().unwrap().leases.len() <= 8);
+
+    /* When most leases are long-lived, a prune frees almost nothing, so the registry also grows.
+    Holding one fewer lease than a capacity boundary is the worst case without that growth: the
+    registry is full again after every churned lease, and each one rescans every held lease.
+    With it, each full scan is followed by at least half its length in pushes, so the churn
+    costs at most two visits per round plus one final scan of the registry. */
+    let boundary = budget(16, 1024);
+    let rounds = budget(200, 10_000);
+    for kept in [boundary - 1, boundary, boundary + 1] {
+        for promote in [false, true] {
+            let visits = prune_visits(kept, rounds, promote);
+            assert!(
+                visits <= 2 * rounds + 4 * (kept + 1),
+                "kept={kept} promote={promote}: {visits} visits for {rounds} rounds"
+            );
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

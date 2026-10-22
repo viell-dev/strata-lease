@@ -265,13 +265,23 @@ impl<B> Retained<B> {
     /// Creates a loaned lease over `range` and registers it, pruning dead registry entries
     /// first when the registry is about to grow.
     ///
-    /// Pruning at capacity keeps the registry proportional to the number of live loaned leases
-    /// with amortized O(1) cost, even when the owner never calls [`Store::maintain`].
+    /// A prune visits every registration, so it must buy room for proportionally many pushes
+    /// before the next one. When fewer than half the registrations are pruned, the registry
+    /// therefore also reserves room for as many again as survived. Either way at least half the
+    /// visited length is free afterwards, so every full scan is paid for by that many pushes:
+    /// the cost stays amortized O(1) per lease even when most leases are long-lived, and the
+    /// registry stays proportional to the number of live loaned leases, even when the owner
+    /// never calls [`Store::maintain`].
     fn lease(&mut self, range: SegmentRange) -> Lease<B> {
         let (lease, registration) = Lease::loaned(Arc::clone(&self.backing), range);
 
         if self.leases.len() == self.leases.capacity() {
             self.prune();
+
+            let survivors = self.leases.len();
+            if survivors > self.leases.capacity() / 2 {
+                self.leases.reserve(survivors);
+            }
         }
 
         self.leases.push(registration);
