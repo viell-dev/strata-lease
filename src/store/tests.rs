@@ -1058,19 +1058,94 @@ fn test_store_compact() {
     assert_eq!(store.bytes(span(4, 6)), Some(b"cc".as_slice()));
     assert_eq!(store.bytes(span(6, 8)), Some(b"dd".as_slice()));
 
-    // So a streaming park-and-retire loop runs in bounded memory
+    // So a streaming park-and-retire loop runs in bounded memory, reusing one allocation
     let mut store = Store::new();
+    let mut capacity = None;
     for round in 0..budget(20, 100) {
         let base = u64::try_from(round * 4).unwrap();
         let id = store.park(base, b"data".to_vec()).unwrap();
         assert!(store.retire(id));
         assert!(store.segments.is_empty());
+        let first = *capacity.get_or_insert(store.segments.capacity());
+        assert_eq!(store.segments.capacity(), first);
     }
     assert_eq!(
         store.segment_count(),
         u64::try_from(budget(20, 100)).unwrap()
     );
     assert_eq!(store.retained_len(), 0);
+}
+
+#[test]
+fn test_store_shrink_to_fit() {
+    let burst = budget(64, 4096);
+    let total = u64::try_from(burst).unwrap();
+    let mut store = Store::new();
+    for base in 0..total {
+        store.park(base, vec![0]).unwrap();
+    }
+
+    // A fully retired burst compacts every entry away but keeps the capacity it needed
+    assert_eq!(store.retire_all(), burst);
+    assert!(store.segments.is_empty());
+    assert!(store.segments.capacity() >= burst);
+
+    // Shrinking releases it without touching the identifier history
+    store.shrink_to_fit();
+    assert_eq!(store.segments.capacity(), 0);
+    assert_eq!(store.segment_count(), total);
+    assert_eq!(store.status(segment_id(0)), Some(SegmentStatus::Retired));
+    assert_eq!(store.park(total, vec![0]).unwrap().index(), total);
+
+    // A substantially retired burst shrinks to the entries still resident
+    let mut store = Store::new();
+    for base in 0..total {
+        store.park(base, vec![0]).unwrap();
+    }
+    let newest = segment_id(total - 1);
+    for index in 0..total - 1 {
+        assert!(store.retire(segment_id(index)));
+    }
+    assert_eq!(store.segments.len(), 1);
+    store.shrink_to_fit();
+    assert_eq!(store.segments.capacity(), 1);
+    assert_eq!(store.bytes(span(total - 1, total)), Some([0].as_slice()));
+    assert_eq!(store.status(newest), Some(SegmentStatus::Sealed));
+
+    // Tombstones behind a surviving oldest segment are history, not spare capacity, so they stay
+    let mut store = Store::new();
+    for base in 0..total {
+        store.park(base, vec![0]).unwrap();
+    }
+    for index in 1..total {
+        assert!(store.retire(segment_id(index)));
+    }
+    store.shrink_to_fit();
+    assert_eq!(store.segments.len(), burst);
+    assert_eq!(store.status(newest), Some(SegmentStatus::Retired));
+
+    // A lease registry keeps the capacity a burst of leases needed until shrinking prunes it
+    let (mut store, id) = parked("0123456789");
+    let kept = store.lease(span(0, 4)).unwrap();
+    drop(
+        (0..burst)
+            .map(|_| store.lease(span(4, 8)).unwrap())
+            .collect::<Vec<_>>(),
+    );
+    let promoted = store.lease(span(8, 10)).unwrap();
+    promoted.promote();
+    assert!(store.segments[0].retained().unwrap().leases.capacity() > burst);
+
+    store.shrink_to_fit();
+    let retained = store.segments[0].retained().unwrap();
+    assert_eq!(retained.leases.len(), 1);
+    assert_eq!(retained.leases.capacity(), 1);
+
+    // The surviving registration still lets retirement promote its lease
+    assert!(store.retire(id));
+    assert!(kept.is_owned());
+    assert_eq!(&*kept.bytes(), b"0123");
+    assert_eq!(&*promoted.bytes(), b"89");
 }
 
 // -----------------------------------------------------------------------------

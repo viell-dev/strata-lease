@@ -60,6 +60,9 @@ byte buffers through promotable leases.
   runs in bounded memory. Lease registries prune themselves as leases are
   handed out, at amortized O(1) cost per lease even when most leases are
   long-lived.
+- `shrink_to_fit`, releasing the spare bookkeeping capacity that compaction
+  and pruning keep for reuse, so a long-lived store can return to a small
+  footprint after a burst without resetting identifiers.
 
 #### Consumer-side operations
 
