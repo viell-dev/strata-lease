@@ -19,6 +19,14 @@ include = [
   "src/store/tests.rs",
   "tests/consumer.rs",
   "tests/hardening.rs",
+  "benches/BASELINE.md",
+  "benches/README.md",
+  "benches/lease.rs",
+  "benches/lease/access.rs",
+  "benches/lease/churn.rs",
+  "benches/lease/reclaim.rs",
+  "benches/memory.rs",
+  "benches/results.csv",
   "Cargo.toml",
   "Cargo.lock",
   "CHANGELOG.md",
@@ -29,6 +37,17 @@ include = [
   "README.md",
   "rust-toolchain.toml",
 ]
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "lease"
+harness = false
+
+[[bench]]
+name = "memory"
+harness = false
 
 [lints.rust]
 future_incompatible = { level = "warn", priority = -1 }

@@ -49,6 +49,9 @@ dependencies and no `unsafe` code.
   streaming park-and-retire loop runs in bounded memory. Emptied capacity is kept for reuse;
   `shrink_to_fit()` releases what a burst left behind without disturbing segment identifiers.
 
+[Benchmarks](benches/README.md) compare lease lifecycles with copying and measure churn and
+reclamation; [measured results](benches/BASELINE.md) include allocation counts for each scenario.
+
 ## Usage
 
 ```rust
