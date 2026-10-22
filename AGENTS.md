@@ -41,6 +41,7 @@ Single-crate library with three private modules, all re-exported at the crate ro
   `u64`-addressable) and hands rejected buffers back in a `ParkError`. `retire` promotes
   surviving leases *before* swapping in the tombstone, then compacts leading tombstones;
   `maintain` retires sealed segments by the wasted-bytes threshold using the O(1) counters.
+  Compaction and pruning keep emptied capacity for reuse; only `shrink_to_fit` releases it.
 
 Key design: the `Store` never blocks on consumers and consumers never need the `Store` to
 promote; both sides synchronize only through the per-lease `Slot`. Live-byte counters are

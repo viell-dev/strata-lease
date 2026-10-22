@@ -318,9 +318,19 @@ impl<B> Retained<B> {
 ///
 /// Retired segments leave a small bookkeeping tombstone behind so that [`SegmentId`]s stay
 /// stable. The store compacts automatically: once the *oldest* parked segments are retired, their
-/// tombstones are freed, so a streaming producer that parks and retires in order runs in bounded
-/// memory. Queries against compacted identifiers keep answering with their settled state
+/// tombstones are removed, so a streaming producer that parks and retires in order runs in
+/// bounded memory. Queries against compacted identifiers keep answering with their settled state
 /// (retired, zero live bytes).
+///
+/// Compaction and lease-registry pruning keep the capacity they empty for reuse instead of
+/// reallocating, so bookkeeping memory follows the historical peak: the most segments resident
+/// at once, and for each retained segment the most leases registered at once. A steady loop
+/// reuses that capacity. After a burst, [`Self::shrink_to_fit`] releases it without touching
+/// identifiers or retained bytes.
+///
+/// Registry entries are weak, so dropping a lease releases its pin at once, but its small shared
+/// state stays allocated until its entry is pruned: when the registry next fills up, during
+/// [`Self::maintain`] or [`Self::shrink_to_fit`], or when the segment retires.
 ///
 /// Dropping the store without retiring is safe: each loaned lease shares ownership of its segment,
 /// so the bytes stay alive until the last loaned lease is dropped or promoted. Retirement is a
@@ -591,6 +601,43 @@ impl<B> Store<B> {
         true
     }
 
+    /// Releases spare bookkeeping capacity left behind by earlier bursts.
+    ///
+    /// The segment list and every lease registry shrink to what they currently hold, after
+    /// pruning registry entries for dropped or already promoted leases. Nothing is retired and no
+    /// segment bytes are freed: [`SegmentId`]s, retained segments, and loaned leases are
+    /// unaffected (see the [memory notes](Store#memory)). Each call reallocates whatever it
+    /// shrinks, so call it after a burst rather than after every park or retirement.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use strata_lease::{SegmentStatus, Store};
+    /// let mut store = Store::new();
+    /// let first = store.park(0, b"x".to_vec()).unwrap();
+    /// for base in 1..1000 {
+    ///     store.park(base, b"x".to_vec()).unwrap();
+    /// }
+    ///
+    /// // The burst retires, but the store keeps capacity sized for 1000 segments
+    /// assert_eq!(store.retire_all(), 1000);
+    /// store.shrink_to_fit();
+    ///
+    /// // Identifiers still answer with their settled state, and numbering continues
+    /// assert_eq!(store.status(first), Some(SegmentStatus::Retired));
+    /// assert_eq!(store.park(1000, b"x".to_vec()).unwrap().index(), 1000);
+    /// ```
+    pub fn shrink_to_fit(&mut self) {
+        self.segments.shrink_to_fit();
+
+        for segment in &mut self.segments {
+            if let Some(retained) = segment.retained_mut() {
+                retained.prune();
+                retained.leases.shrink_to_fit();
+            }
+        }
+    }
+
     /// Returns the segment for `id` when it has not been compacted away.
     fn entry(&self, id: SegmentId) -> Option<&Segment<B>> {
         let offset = id.index().checked_sub(self.compacted)?;
@@ -629,10 +676,11 @@ impl<B> Store<B> {
         Some((position, range))
     }
 
-    /// Frees the bookkeeping of leading retired segments.
+    /// Removes the tombstones of leading retired segments.
     ///
     /// Only ever removes retired segments, whose observable state is settled, so compaction is
-    /// invisible through the public API apart from the memory it returns.
+    /// invisible through the public API. The emptied deque capacity is kept for later parks;
+    /// [`Self::shrink_to_fit`] releases it.
     fn compact(&mut self) {
         while self.segments.front().is_some_and(Segment::is_retired) {
             self.segments.pop_front();

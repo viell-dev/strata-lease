@@ -46,7 +46,8 @@ dependencies and no `unsafe` code.
   action, not a safety requirement.
 - **Bounded bookkeeping**: lease registries prune themselves as leases are handed out, and the
   tombstones of retired segments compact away once everything parked before them retires, so a
-  streaming park-and-retire loop runs in bounded memory.
+  streaming park-and-retire loop runs in bounded memory. Emptied capacity is kept for reuse;
+  `shrink_to_fit()` releases what a burst left behind without disturbing segment identifiers.
 
 ## Usage
 
