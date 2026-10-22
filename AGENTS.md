@@ -60,3 +60,13 @@ Two kinds of tests, both Miri-clean:
   as usage examples (and are MIT-0 example material), so favor guidance over terseness.
   `consumer.rs` holds the intended-use scenarios; `hardening.rs` holds the adversarial ones (the
   barrier-forced retirement race and the randomized reference-model lifecycle).
+
+## Benchmarks
+
+- `benches/lease.rs` is a Criterion harness with modules under `benches/lease/`, one per
+  question; `benches/memory.rs` is a separate allocation-counting harness without Criterion. Its
+  counting `GlobalAlloc` is the repository's only `unsafe` code, under `#[expect(unsafe_code)]`.
+- `benches/README.md` is the methodology, `benches/BASELINE.md` the measured results, and
+  `benches/results.csv` the raw estimates. Validate outputs before timing; every timed case and
+  the memory harness also run in smoke mode under `cargo test --all-targets`.
+- Benchmarks are example material and ship in the package: keep the `include` list current.

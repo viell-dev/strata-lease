@@ -92,6 +92,12 @@ byte buffers through promotable leases.
   tests under `tests/` written as commented public-API scenarios: intended
   use in `consumer.rs`, and the thread race and randomized reference-model
   lifecycle in `hardening.rs`. The whole suite is Miri-clean.
+- Criterion benchmarks comparing lease lifecycles with copying and measuring
+  reads, clones, churn next to long-lived leases, promotion, retirement, and
+  maintenance, plus an allocation-counting harness for bookkeeping and buffer
+  release, with methodology and paired baseline runs. Criterion is a
+  development-only dependency, and the harness's counting allocator, outside
+  the library, is the repository's only `unsafe` code.
 - `Cargo.toml` metadata including `repository`, `keywords`, `categories`,
   and a curated `include` list.
 - Strict lint configuration: `unsafe_code = "deny"`, `missing_docs`,
